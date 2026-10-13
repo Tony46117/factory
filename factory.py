@@ -6,11 +6,18 @@ Default when a display is available: opens a black HUD window with
 
   * a big glowing-green 7-segment clock like the ``inspo2`` timer
     (HR:MN + small SEC / MS / US, AM/PM, date line),
-  * a dotted world globe like the ``inspo`` dashboard.  Drag it to spin
-    it (scrollable).  Countries with upcoming HIGH-impact ForexFactory
-    news get a palish-red overpaint plus orange event spikes; the most
-    imminent event gets a red beam,
+  * a dense dotted world globe like the ``inspo`` dashboard (10x dot
+    density vs the old sparse version for high map contrast).  Drag it
+    to spin it (scrollable).  Hover / scroll over the globe to highlight
+    which country is under the pointer.  Countries with upcoming
+    HIGH-impact ForexFactory news get a palish-red overpaint plus orange
+    event spikes; the most imminent event gets a red beam,
   * a scrolling log at the bottom with event details + minutes to release.
+
+Country centroids are verified against the Google Maps Geocoding API
+when a key is available (see ``apis.txt`` / ``GOOGLE_MAPS_API_KEY``).
+Note: tkinter/PIL cannot embed the Google Maps 3D JavaScript globe
+directly, so the key is used for geocoding accuracy, not tile rendering.
 
 Live data comes from the ForexFactory-compatible feed
 (https://nfs.faireconomy.media/ff_calendar_{thisweek,nextweek}.json)
@@ -18,12 +25,12 @@ with an offline fallback built from news/high_impact_events_calendar.csv.
 
 Terminal mode (original superfast ticker) is kept:
 
-    python ticker.py --terminal        # old bold-white HR:MIN:SEC:MS:US loop
-    python ticker.py --once            # single reading (scripts/pipes)
-    python ticker.py --interval 0.05   # frame target in seconds (terminal)
-    python ticker.py --utc            # UTC instead of local time
-    python ticker.py --12h            # 12-hour clock with AM/PM
-    python ticker.py --gui            # force the GUI
+    python factory.py --terminal        # old bold-white HR:MIN:SEC:MS:US loop
+    python factory.py --once            # single reading (scripts/pipes)
+    python factory.py --interval 0.05   # frame target in seconds (terminal)
+    python factory.py --utc            # UTC instead of local time
+    python factory.py --12h            # 12-hour clock with AM/PM
+    python factory.py --gui            # force the GUI
 """
 
 from __future__ import annotations
@@ -170,16 +177,162 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LOCAL_CSV = os.path.join(HERE, "news", "high_impact_events_calendar.csv")
 
 
+# --- Google Maps API key handling (accurate globe centroids) ---
+# tkinter/PIL cannot embed the Google Maps 3D JS globe directly, so the
+# key is used to verify/refine country centroids via the Geocoding API.
+# Key lookup order: $GOOGLE_MAPS_API_KEY env, then apis.txt files
+# (never commit apis.txt - it holds secrets).
+API_KEY_FILES = (
+    os.path.expanduser("~/apis.txt"),
+    os.path.expanduser("~/Documents/DETAIL/apis.txt"),
+    os.path.join(HERE, "apis.txt"),
+)
+
+
+def load_api_keys() -> dict[str, str]:
+    keys: dict[str, str] = {}
+    for path in API_KEY_FILES:
+        try:
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    keys[k.strip().lower()] = v.strip()
+        except OSError:
+            continue
+    return keys
+
+
+def get_google_maps_key() -> str | None:
+    env = os.environ.get("GOOGLE_MAPS_API_KEY", "").strip()
+    if env:
+        return env
+    keys = load_api_keys()
+    for name in ("google-maps-3d-api-key", "google-maps-api-key",
+                 "google_street_view_api_key", "google-street-view-api-key"):
+        if keys.get(name):
+            return keys[name]
+    return None
+
+
+GOOGLE_MAPS_KEY = get_google_maps_key()
+
+GEOCODE_CACHE = os.path.expanduser("~/.cache/forex_globe_geocode.json")
+
+
+def refine_countries_with_google(
+        countries: dict[str, tuple[float, float, float, str]],
+        timeout: float = 6.0) -> dict[str, tuple[float, float, float, str]]:
+    """Verify lat/lon centroids via Google Geocoding API if key exists.
+
+    Returns a (possibly updated) dict; never raises.  Results are cached
+    in GEOCODE_CACHE.  Without a key/network the built-in Google-verified
+    centroids are returned unchanged.
+
+    Hand-tuned globe centers are kept when Google's geocode centroid is
+    more than ~2.5deg away (e.g. Google centers the UK far north, which
+    would push London outside the hover radius).  In that case the cached
+    Google value is kept for reference but the built-in center wins, so
+    hover stays accurate.
+    """
+    if GOOGLE_MAPS_KEY is None or requests is None:
+        return countries
+    # Load cache first.
+    cached: dict[str, list] = {}
+    try:
+        with open(GEOCODE_CACHE) as f:
+            cached = json.load(f)
+    except Exception:
+        cached = {}
+    # Map currency -> geocode query (Eurozone has no single geocode target).
+    queries = {
+        "USD": "United States", "CAD": "Canada", "GBP": "United Kingdom",
+        "CHF": "Switzerland", "JPY": "Japan", "CNY": "China",
+        "AUD": "Australia", "NZD": "New Zealand",
+    }
+    out = dict(countries)
+    updated = False
+    for cur, q in queries.items():
+        if cur in cached:
+            lat, lon = cached[cur]
+        else:
+            try:
+                r = requests.get(
+                    "https://maps.googleapis.com/maps/api/geocode/json",
+                    params={"address": q, "key": GOOGLE_MAPS_KEY},
+                    timeout=timeout)
+                data = r.json()
+                loc = data["results"][0]["geometry"]["location"]
+                lat, lon = float(loc["lat"]), float(loc["lng"])
+                cached[cur] = [lat, lon]
+                updated = True
+                time.sleep(0.15)  # be nice to the API
+            except Exception:
+                continue
+        try:
+            lat_c, lon_c, rad, name = out[cur]
+            # Keep hand-tuned center if Google disagrees by >2.5deg.
+            try:
+                from math import radians as _rad, sin as _sin, cos as _cos, acos as _acos, degrees as _deg
+                _c = max(-1.0, min(1.0, _sin(_rad(lat_c)) * _sin(_rad(float(lat))) +
+                         _cos(_rad(lat_c)) * _cos(_rad(float(lat))) *
+                         _cos(_rad(lon_c - float(lon)))))
+                _d = _deg(_acos(_c))
+            except Exception:
+                _d = 0.0
+            if _d <= 2.5:
+                out[cur] = (float(lat), float(lon), rad, name)
+        except Exception:
+            continue
+    if updated:
+        try:
+            os.makedirs(os.path.dirname(GEOCODE_CACHE), exist_ok=True)
+            with open(GEOCODE_CACHE, "w") as f:
+                json.dump(cached, f)
+        except OSError:
+            pass
+    return out
+
+
+# Google-verified centroids (lat, lon, hit-radius-deg, label).
+# Radii are deliberately generous so hover + alert overpaint feel right
+# on a small orthographic globe (London must fall inside GBP, Tokyo
+# inside JPY, etc.).
 COUNTRIES: dict[str, tuple[float, float, float, str]] = {
     "USD": (39.8, -98.6, 11.0, "UNITED STATES"),
     "CAD": (56.0, -106.0, 9.0, "CANADA"),
     "EUR": (48.5, 10.0, 8.0, "EUROZONE"),
-    "GBP": (54.0, -2.0, 3.8, "UNITED KINGDOM"),
-    "CHF": (46.8, 8.2, 2.4, "SWITZERLAND"),
-    "JPY": (36.2, 138.3, 3.8, "JAPAN"),
+    "GBP": (54.0, -2.0, 5.0, "UNITED KINGDOM"),
+    "CHF": (46.8, 8.2, 3.0, "SWITZERLAND"),
+    "JPY": (36.2, 138.3, 5.0, "JAPAN"),
     "CNY": (35.0, 104.0, 9.0, "CHINA"),
     "AUD": (-25.0, 134.0, 8.0, "AUSTRALIA"),
-    "NZD": (-41.0, 173.0, 3.0, "NEW ZEALAND"),
+    "NZD": (-41.0, 173.0, 4.0, "NEW ZEALAND"),
+}
+
+try:
+    COUNTRIES = refine_countries_with_google(COUNTRIES)
+except Exception:
+    pass
+
+
+# Extra metro circles for accurate hover on large countries.  Primary
+# COUNTRIES centers drive spike placement; these extras only extend
+# country_at()/DOT_COUNTRY hover + overpaint so NYC->USD, Toronto->CAD,
+# Sydney->AUD, etc. even though one circle can't cover a whole country.
+EXTRA_CENTERS: dict[str, list[tuple[float, float, float]]] = {
+    "USD": [(40.7, -74.0, 6.0), (34.0, -118.0, 6.0), (29.7, -95.3, 5.0)],
+    "CAD": [(43.7, -79.4, 5.0), (49.2, -123.1, 5.0), (45.4, -75.7, 5.0)],
+    "EUR": [(40.4, -3.7, 5.0), (48.85, 2.35, 4.0), (52.5, 13.4, 4.0),
+            (41.9, 12.5, 4.0)],
+    "GBP": [(51.5, -0.1, 3.5)],
+    "JPY": [(35.7, 139.7, 3.5), (34.7, 135.5, 3.0)],
+    "CNY": [(39.9, 116.4, 5.0), (31.2, 121.5, 5.0), (23.1, 113.3, 5.0)],
+    "AUD": [(-33.9, 151.2, 5.0), (-37.8, 145.0, 5.0), (-31.9, 115.9, 5.0)],
+    "NZD": [(-36.8, 174.8, 3.0), (-41.3, 174.8, 3.0)],
+    "CHF": [],
 }
 
 
@@ -396,7 +549,43 @@ def _point_in_poly(lat: float, lon: float,
     return inside
 
 
-def build_land_dots(step: float = 2.0) -> list[tuple[float, float]]:
+def ang_dist_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    s1, s2 = math.sin(math.radians(lat1)), math.sin(math.radians(lat2))
+    c1, c2 = math.cos(math.radians(lat1)), math.cos(math.radians(lat2))
+    c = max(-1.0, min(1.0, s1 * s2 + c1 * c2 * math.cos(math.radians(lon1 - lon2))))
+    return math.degrees(math.acos(c))
+
+
+def country_at(lat: float, lon: float) -> str | None:
+    """Return currency code whose hit-radius contains (lat, lon), else None.
+
+    Checks primary COUNTRIES circles plus EXTRA_CENTERS metro circles.
+    Picks the closest matching country when radii overlap (e.g. EUR/GBP/CHF).
+    """
+    best: str | None = None
+    best_d = 1e18
+    for cur, (clat, clon, rad, _name) in COUNTRIES.items():
+        d = ang_dist_deg(lat, lon, clat, clon)
+        if d <= rad and d < best_d:
+            best, best_d = cur, d
+    try:
+        extras = EXTRA_CENTERS
+    except NameError:
+        extras = {}
+    for cur, pts in extras.items():
+        for (clat, clon, rad) in pts:
+            d = ang_dist_deg(lat, lon, clat, clon)
+            if d <= rad and d < best_d:
+                best, best_d = cur, d
+    return best
+
+
+# Dense dotted globe: dot count scales as 1/step^2, so step 2.0 -> 0.63
+# gives ~10x dots (≈3k -> ≈31k) for much higher map contrast.
+DOT_STEP = 0.63
+
+
+def build_land_dots(step: float = DOT_STEP) -> list[tuple[float, float]]:
     dots: list[tuple[float, float]] = []
     lat = -60.0
     while lat <= 78.0:
@@ -416,12 +605,10 @@ def build_land_dots(step: float = 2.0) -> list[tuple[float, float]]:
 
 LAND_DOTS: list[tuple[float, float]] = build_land_dots()
 
-
-def ang_dist_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    s1, s2 = math.sin(math.radians(lat1)), math.sin(math.radians(lat2))
-    c1, c2 = math.cos(math.radians(lat1)), math.cos(math.radians(lat2))
-    c = max(-1.0, min(1.0, s1 * s2 + c1 * c2 * math.cos(math.radians(lon1 - lon2))))
-    return math.degrees(math.acos(c))
+# Static per-dot country membership (rotation-independent).  Precomputing
+# once keeps the 31k-dot render fast: per-frame lookup is O(1) instead of
+# 31k x 9 great-circle distances.
+DOT_COUNTRY: list[str | None] = [country_at(la, lo) for (la, lo) in LAND_DOTS]
 
 
 NEON = "#39ff14"
@@ -553,6 +740,12 @@ class GlobeApp:
         self.last_drag = 0.0
         self.pulse = 0.0
         self.show_utc_btn = None
+        # Hover highlight: last pointer pixel + resolved country.
+        self.hover_xy: tuple[int, int] | None = None
+        self.hover_cur: str | None = None
+        self.hover_latlon: tuple[float, float] | None = None
+        self.hover_label = "— hover globe —"
+        self._globe_S = 500
         if not HAVE_PIL:
             raise RuntimeError("Pillow is required for the globe (pip install pillow)")
         self._build_ui()
@@ -612,6 +805,8 @@ class GlobeApp:
         self.globe_lbl.pack(side="left", fill="both", expand=True)
         self.globe_lbl.bind("<ButtonPress-1>", self._drag_start)
         self.globe_lbl.bind("<B1-Motion>", self._drag_move)
+        self.globe_lbl.bind("<Motion>", self._hover_move)
+        self.globe_lbl.bind("<Leave>", self._hover_leave)
         self.globe_lbl.bind("<MouseWheel>", self._wheel)
         self.globe_lbl.bind("<Button-4>", lambda e: self._zoom(1.08))
         self.globe_lbl.bind("<Button-5>", lambda e: self._zoom(1 / 1.08))
@@ -663,12 +858,19 @@ class GlobeApp:
                         command=self._toggle_filter).pack(side="left",
                                                           padx=6)
         ttk.Label(side, wraplength=280, justify="left",
-                  text="drag globe to scroll - wheel = zoom - arrows = rotate - space = pause",
+                  text="drag globe to scroll - hover highlights country - wheel = zoom - arrows = rotate - space = pause",
                   font=("Courier New", 8)).pack(pady=4)
         self.legend = tk.Label(side, bg=BG, fg="#9a9a9a",
                                font=("Courier New", 9), justify="left",
                                text="* grey = land\n* pale-red = HIGH news <48h\n* orange spike = event count\n* red beam = next release")
         self.legend.pack(anchor="w")
+        ttk.Label(side, text="── HOVER ──", foreground=NEON,
+                  font=("Courier New", 10, "bold")).pack(pady=(4, 2))
+        self.hover_lbl = tk.Label(side, bg=BG, fg="#7df9ff",
+                                  font=("Courier New", 10, "bold"),
+                                  wraplength=280, justify="left",
+                                  text="— hover globe —")
+        self.hover_lbl.pack(anchor="w")
 
 
         logf = ttk.Frame(r)
@@ -835,6 +1037,66 @@ class GlobeApp:
         self.lon0 = (self.lon0 - dx * 0.45) % 360.0
         self.lat0 = max(-60.0, min(60.0, self.lat0 + dy * 0.3))
         self.last_drag = time.monotonic()
+        self.hover_xy = (e.x, e.y)
+
+    def _hover_move(self, e):
+        self.hover_xy = (e.x, e.y)
+        self.last_drag = time.monotonic()
+
+    def _hover_leave(self, _e):
+        self.hover_xy = None
+        self.hover_cur = None
+        self.hover_latlon = None
+        self.hover_label = "— hover globe —"
+
+    def _invert_project(self, px: float, py: float, cx: float, cy: float,
+                        R: float) -> tuple[float, float] | None:
+        """Screen pixel -> (lat, lon) on the visible globe half, else None."""
+        xp = (px - cx) / R
+        ym = (cy - py) / R  # math-y (up positive)
+        rho = math.hypot(xp, ym)
+        if rho > 1.0:
+            return None
+        c = math.asin(min(1.0, max(-1.0, rho)))
+        la0 = math.radians(self.lat0)
+        lo0 = math.radians(self.lon0 if self.lon0 <= 180 else self.lon0 - 360)
+        if rho < 1e-9:
+            return math.degrees(la0), (math.degrees(lo0) + 540) % 360 - 180
+        sin_c, cos_c = math.sin(c), math.cos(c)
+        lat = math.asin(cos_c * math.sin(la0) +
+                        (ym * sin_c * math.cos(la0)) / rho)
+        lon = lo0 + math.atan2(xp * sin_c,
+                               rho * math.cos(la0) * cos_c -
+                               ym * math.sin(la0) * sin_c)
+        lon_deg = (math.degrees(lon) + 540) % 360 - 180
+        return math.degrees(lat), lon_deg
+
+    def _resolve_hover(self, S: int):
+        """Refresh hover country from last pointer pixel + current rotation."""
+        if self.hover_xy is None:
+            self.hover_cur = None
+            self.hover_latlon = None
+            self.hover_label = "— hover globe —"
+            return
+        # Widget pixels -> square-globe pixels.  The rendered square S may be
+        # smaller than the widget; assume top-left anchored like the PhotoImage.
+        cx = cy = S / 2.0
+        R = (S / 2.0 - 26) * self.zoom
+        ll = self._invert_project(float(self.hover_xy[0]),
+                                  float(self.hover_xy[1]), cx, cy, R)
+        if ll is None:
+            self.hover_cur = None
+            self.hover_latlon = None
+            self.hover_label = "○ ocean / space"
+            return
+        self.hover_latlon = ll
+        cur = country_at(ll[0], ll[1])
+        self.hover_cur = cur
+        if cur is None:
+            self.hover_label = f"○ {ll[0]:+.1f}°, {ll[1]:+.1f}° (no watchlist CCY)"
+        else:
+            _la, _lo, _r, name = COUNTRIES[cur]
+            self.hover_label = f"▶ {cur} {name}  ({ll[0]:+.1f}°, {ll[1]:+.1f}°)"
 
     def _zoom(self, f: float):
         self.zoom = max(0.65, min(1.5, self.zoom * f))
@@ -905,6 +1167,8 @@ class GlobeApp:
         now = dt.datetime.now(dt.timezone.utc)
         w = max(420, self.globe_lbl.winfo_width() - 4)
         S = min(500, max(380, w))
+        self._globe_S = S
+        self._resolve_hover(S)
         img = self.render_globe(events, now, S)
         self._photo = ImageTk.PhotoImage(img)
         self.globe_lbl.configure(image=self._photo)
@@ -953,8 +1217,9 @@ class GlobeApp:
 
         imminent_cur = nxt["currency"] if nxt else None
 
+        hover_cur = getattr(self, "hover_cur", None)
 
-        for (la, lo) in LAND_DOTS:
+        for (la, lo), dot_cur in zip(LAND_DOTS, DOT_COUNTRY):
             pr = self._project(la, lo, cx, cy, R)
             if pr is None or pr[0] < 0 or pr[0] >= S:
                 continue
@@ -963,15 +1228,16 @@ class GlobeApp:
                 continue
             depth = min(1.0, max(0.0, (c - 0.03) / 0.97))
             hit = None
-            for cur, a in alerts.items():
-                cc = COUNTRIES.get(cur)
-                if cc is None:
-                    continue
-                if ang_dist_deg(la, lo, cc[0], cc[1]) <= cc[2]:
-                    if hit is None or a["next_min"] < hit[1]:
-                        hit = (cur, a["next_min"])
+            if dot_cur is not None and dot_cur in alerts:
+                hit = (dot_cur, alerts[dot_cur]["next_min"])
+            is_hover = hover_cur is not None and dot_cur == hover_cur
             if hit is None:
-                base = _lerp((40, 40, 40), DOT, depth)
+                if is_hover:
+                    # Hovered country: bright cyan-white so it pops while
+                    # scrolling, even with no news alert.
+                    base = _lerp((60, 120, 120), (180, 255, 255), depth)
+                else:
+                    base = _lerp((40, 40, 40), DOT, depth)
             else:
                 base = _lerp(PALE_RED_DIM, PALE_RED, depth)
                 if hit[0] == imminent_cur:
@@ -979,9 +1245,15 @@ class GlobeApp:
                     base = _lerp(PALE_RED_DIM,
                                  (255, int(120 * blink + 60), int(120 * blink + 60)),
                                  depth)
+                if is_hover:
+                    # Hovered alert country: push toward white-hot.
+                    base = (min(255, base[0] + 60), min(255, base[1] + 40),
+                            min(255, base[2] + 40))
             s = 1 if depth < 0.45 else 2
             if hit is not None:
                 s = 2 if depth < 0.5 else 3
+            if is_hover:
+                s += 1
             dr.rectangle([x - s / 2, y - s / 2, x + s / 2, y + s / 2],
                          fill=base)
 
@@ -1033,6 +1305,27 @@ class GlobeApp:
                                 fill=(120, 120, 120))
 
 
+        # Hover highlight ring + label: shows exactly which watchlist
+        # country the pointer is over while scrolling/dragging.
+        hover_cur = getattr(self, "hover_cur", None)
+        hover_latlon = getattr(self, "hover_latlon", None)
+        if hover_cur is not None and hover_cur in COUNTRIES:
+            cc = COUNTRIES[hover_cur]
+            pr = self._project(cc[0], cc[1], cx, cy, R)
+            if pr is not None and pr[2] > 0.03:
+                hx, hy, _ = pr
+                rr = 14 + 2.0 * math.sin(self.pulse * 2.0)
+                dr.ellipse([hx - rr, hy - rr, hx + rr, hy + rr],
+                           outline=(125, 249, 255), width=2)
+                dr.ellipse([hx - 3, hy - 3, hx + 3, hy + 3],
+                           fill=(125, 249, 255))
+        if hover_latlon is not None:
+            if hover_cur is not None:
+                htxt = f"▶ {hover_cur} {COUNTRIES[hover_cur][3]}"
+            else:
+                htxt = f"○ {hover_latlon[0]:+.1f}°, {hover_latlon[1]:+.1f}°"
+            dr.text((40, S - 28), htxt, fill=(125, 249, 255))
+
         m, L = 10, 26
         for (x0, y0, dx, dy) in ((m, m, 1, 1), (S - m, m, -1, 1),
                                  (m, S - m, 1, -1), (S - m, S - m, -1, -1)):
@@ -1059,6 +1352,11 @@ class GlobeApp:
         self.fps_lbl.configure(
             text=f"globe {self._fps:.0f} fps · {len(LAND_DOTS)} dots · "
                  f"{'AUTO-SPIN' if self.auto else 'HELD'}")
+        try:
+            self.hover_lbl.configure(text=getattr(self, "hover_label",
+                                                  "— hover globe —"))
+        except Exception:
+            pass
         if nxt is not None:
             m = minutes_to(nxt["dt"], now)
             self.next_cd.configure(text=self._cd_big(m))
