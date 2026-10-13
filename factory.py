@@ -1,6 +1,14 @@
-#!/usr/bin/env python3.12
+#!/usr/bin/env python3
 
 """Forex news globe + LED ticker (inspo / inspo2 style).
+
+ZERO-CONFIG QUICKSTART (fresh clone)::
+
+    python3 factory.py
+
+No keys, env vars, or manual pip steps. Missing wheels
+(pillow/numpy/requests/shapely) self-install, maps download once to
+~/.cache/forex_globe_maps, feed runs live with offline fallback.
 
 Default when a display is available: opens a black HUD window with
 
@@ -9,7 +17,9 @@ Default when a display is available: opens a black HUD window with
   * a dense dotted world globe like the ``inspo`` dashboard (10x dot
     density vs the old sparse version for high map contrast).  Drag it
     to spin it (scrollable).  Hover / scroll over the globe to highlight
-    which country is under the pointer.  Countries with upcoming
+    which country is under the pointer - the country name is revealed
+    instantly in a top banner on the globe, in the HOVER side panel,
+    and as bottom-overlay coordinates.  Countries with upcoming
     HIGH-impact ForexFactory news get a palish-red overpaint plus orange
     event spikes; the most imminent event gets a red beam,
   * a scrolling log at the bottom with event details + minutes to release.
@@ -46,10 +56,50 @@ import datetime as dt
 import json
 import math
 import os
+import subprocess
 import sys
 import threading
 import time
 
+
+def _ensure_runtime_deps() -> None:
+    """Zero-config bootstrap: pip-install missing wheels, then continue.
+
+    Safe on every startup (~ms when deps present). Never raises;
+    offline machines keep graceful fallbacks. Set
+    FACTORY_NO_AUTOINSTALL=1 to disable.
+    """
+    if os.environ.get("FACTORY_NO_AUTOINSTALL"):
+        return
+    missing: list[str] = []
+    try:
+        import PIL  # noqa: F401
+    except Exception:
+        missing.append("pillow")
+    try:
+        import numpy  # noqa: F401
+    except Exception:
+        missing.append("numpy")
+    try:
+        import requests  # noqa: F401
+    except Exception:
+        missing.append("requests")
+    try:
+        import shapely  # noqa: F401
+    except Exception:
+        missing.append("shapely")
+    if not missing:
+        return
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet",
+             "--disable-pip-version-check", *missing],
+            timeout=180)
+    except Exception:
+        pass
+
+
+_ensure_runtime_deps()
 
 try:
     import requests
@@ -60,7 +110,12 @@ try:
     from PIL import Image, ImageDraw, ImageTk
     HAVE_PIL = True
 except Exception:
-    HAVE_PIL = False
+    try:
+        from PIL import Image, ImageDraw  # type: ignore
+        ImageTk = None  # type: ignore
+        HAVE_PIL = True
+    except Exception:
+        HAVE_PIL = False
 
 try:
     import numpy as np
@@ -1170,12 +1225,23 @@ class GlobeApp:
         self.hover_latlon: tuple[float, float] | None = None
         self.hover_label = "— hover globe —"
         self._globe_S = 500
+        self._globe_ox = 0.0
+        self._globe_oy = 0.0
+        self._globe_ww = 500
+        self._globe_wh = 500
         if not HAVE_PIL:
             raise RuntimeError("Pillow is required for the globe (pip install pillow)")
         self._build_ui()
         self._fetch_async()
         try:
             schedule_google_refresh()
+        except Exception:
+            pass
+        # Preload country polygons off the GUI thread so the very first
+        # hover resolves instantly to a real country name (no 1-2s stall).
+        try:
+            th = threading.Thread(target=_load_ccy_geo_only, daemon=True)
+            th.start()
         except Exception:
             pass
         self._tick_timer()
@@ -1229,15 +1295,16 @@ class GlobeApp:
 
         mid = ttk.Frame(r)
         mid.pack(fill="both", expand=True, padx=10)
-        self.globe_lbl = tk.Label(mid, bg=BG, bd=1, relief="solid")
+        self.globe_lbl = tk.Label(mid, bg=BG, bd=1, relief="solid",
+                                  anchor="center", justify="center")
         self.globe_lbl.pack(side="left", fill="both", expand=True)
         self.globe_lbl.bind("<ButtonPress-1>", self._drag_start)
         self.globe_lbl.bind("<B1-Motion>", self._drag_move)
         self.globe_lbl.bind("<Motion>", self._hover_move)
         self.globe_lbl.bind("<Leave>", self._hover_leave)
         self.globe_lbl.bind("<MouseWheel>", self._wheel)
-        self.globe_lbl.bind("<Button-4>", lambda e: self._zoom(1.08))
-        self.globe_lbl.bind("<Button-5>", lambda e: self._zoom(1 / 1.08))
+        self.globe_lbl.bind("<Button-4>", self._wheel_linux_in)
+        self.globe_lbl.bind("<Button-5>", self._wheel_linux_out)
         r.bind("<Left>", lambda e: self._nudge(8, 0))
         r.bind("<Right>", lambda e: self._nudge(-8, 0))
         r.bind("<Up>", lambda e: self._nudge(0, 5))
@@ -1466,10 +1533,22 @@ class GlobeApp:
         self.lat0 = max(-60.0, min(60.0, self.lat0 + dy * 0.3))
         self.last_drag = time.monotonic()
         self.hover_xy = (e.x, e.y)
+        # Resolve immediately so the country name follows the cursor
+        # while dragging, not one frame later.
+        try:
+            self._resolve_hover(self._globe_S, self._globe_ox,
+                                self._globe_oy)
+        except Exception:
+            pass
 
     def _hover_move(self, e):
         self.hover_xy = (e.x, e.y)
         self.last_drag = time.monotonic()
+        try:
+            self._resolve_hover(self._globe_S, self._globe_ox,
+                                self._globe_oy)
+        except Exception:
+            pass
 
     def _hover_leave(self, _e):
         self.hover_xy = None
@@ -1499,19 +1578,36 @@ class GlobeApp:
         lon_deg = (math.degrees(lon) + 540) % 360 - 180
         return math.degrees(lat), lon_deg
 
-    def _resolve_hover(self, S: int):
-        """Refresh hover country from last pointer pixel + current rotation."""
+    def _resolve_hover(self, S: int, ox: float = 0.0, oy: float = 0.0):
+        """Refresh hover country from last pointer pixel + current rotation.
+
+        Widget pixel (e.x, e.y) -> image pixel by subtracting the centering
+        offset (ox, oy): the S×S globe PhotoImage is centered inside the
+        (often larger) Label widget.  The old code assumed top-left
+        anchoring, so every hover missed by (ww-S)/2 pixels and the
+        country name never appeared - this is the active-hover fix.
+        """
         if self.hover_xy is None:
             self.hover_cur = None
             self.hover_latlon = None
             self.hover_label = "— hover globe —"
             return
-        # Widget pixels -> square-globe pixels.  The rendered square S may be
-        # smaller than the widget; assume top-left anchored like the PhotoImage.
+        # Back-compat: _resolve_hover(S) called from old code / tests.
+        try:
+            _ox, _oy = float(ox), float(oy)
+        except Exception:
+            _ox, _oy = 0.0, 0.0
+        ix = float(self.hover_xy[0]) - _ox
+        iy = float(self.hover_xy[1]) - _oy
         cx = cy = S / 2.0
         R = (S / 2.0 - 26) * self.zoom
-        ll = self._invert_project(float(self.hover_xy[0]),
-                                  float(self.hover_xy[1]), cx, cy, R)
+        # Outside the square image entirely -> definitely not on globe.
+        if not (0 <= ix < S and 0 <= iy < S):
+            self.hover_cur = None
+            self.hover_latlon = None
+            self.hover_label = "○ ocean / space"
+            return
+        ll = self._invert_project(ix, iy, cx, cy, R)
         if ll is None:
             self.hover_cur = None
             self.hover_latlon = None
@@ -1530,7 +1626,28 @@ class GlobeApp:
         self.zoom = max(0.65, min(1.5, self.zoom * f))
 
     def _wheel(self, e):
+        try:
+            self.hover_xy = (e.x, e.y)
+        except Exception:
+            pass
         self._zoom(1.08 if getattr(e, "delta", 0) > 0 else 1 / 1.08)
+        self.last_drag = time.monotonic()
+
+    def _wheel_linux_in(self, e):
+        try:
+            self.hover_xy = (e.x, e.y)
+        except Exception:
+            pass
+        self._zoom(1.08)
+        self.last_drag = time.monotonic()
+
+    def _wheel_linux_out(self, e):
+        try:
+            self.hover_xy = (e.x, e.y)
+        except Exception:
+            pass
+        self._zoom(1 / 1.08)
+        self.last_drag = time.monotonic()
 
     def _nudge(self, dx: float, dy: float):
         self.lon0 = (self.lon0 + dx) % 360.0
@@ -1593,10 +1710,23 @@ class GlobeApp:
     def _draw_globe(self):
         events, _ = self._snapshot()
         now = dt.datetime.now(dt.timezone.utc)
-        w = max(420, self.globe_lbl.winfo_width() - 4)
+        try:
+            ww = max(1, self.globe_lbl.winfo_width())
+            wh = max(1, self.globe_lbl.winfo_height())
+        except Exception:
+            ww, wh = 500, 500
+        w = max(420, ww - 4)
         S = min(500, max(380, w))
+        # PhotoImage is CENTERED in the Label: remember the offset so
+        # hover pixels map exactly onto globe pixels (the hover fix).
+        ox = max(0.0, (ww - S) / 2.0)
+        oy = max(0.0, (wh - S) / 2.0)
         self._globe_S = S
-        self._resolve_hover(S)
+        self._globe_ox = ox
+        self._globe_oy = oy
+        self._globe_ww = ww
+        self._globe_wh = wh
+        self._resolve_hover(S, ox, oy)
         img = self.render_globe(events, now, S)
         self._photo = ImageTk.PhotoImage(img)
         self.globe_lbl.configure(image=self._photo)
@@ -1716,7 +1846,9 @@ class GlobeApp:
                                 fill=(120, 120, 120))
 
         # Hover highlight ring + label: shows exactly which watchlist
-        # country the pointer is over while scrolling/dragging.
+        # country the pointer is over while scrolling/dragging.  The
+        # country NAME is always revealed: top banner + crosshair at the
+        # exact pointer + bottom readout + HOVER side panel.
         hover_cur = getattr(self, "hover_cur", None)
         hover_latlon = getattr(self, "hover_latlon", None)
         if hover_cur is not None and hover_cur in COUNTRIES:
@@ -1729,12 +1861,48 @@ class GlobeApp:
                            outline=(125, 249, 255), width=2)
                 dr.ellipse([hx - 3, hy - 3, hx + 3, hy + 3],
                            fill=(125, 249, 255))
+        # Crosshair exactly under the cursor (proves hover is live).
+        if hover_latlon is not None:
+            pr = self._project(hover_latlon[0], hover_latlon[1],
+                               cx, cy, R)
+            if pr is not None and pr[2] > 0.0:
+                px_, py_, _ = pr
+                dr.line([(px_ - 8, py_), (px_ + 8, py_)],
+                        fill=(125, 249, 255), width=1)
+                dr.line([(px_, py_ - 8), (px_, py_ + 8)],
+                        fill=(125, 249, 255), width=1)
         if hover_latlon is not None:
             if hover_cur is not None:
                 htxt = f"▶ {hover_cur} {COUNTRIES[hover_cur][3]}"
+                btxt = (f"▶ {hover_cur} {COUNTRIES[hover_cur][3]}  "
+                        f"({hover_latlon[0]:+.1f}, {hover_latlon[1]:+.1f})")
             else:
-                htxt = f"○ {hover_latlon[0]:+.1f}°, {hover_latlon[1]:+.1f}°"
-            dr.text((40, S - 28), htxt, fill=(125, 249, 255))
+                htxt = f"○ {hover_latlon[0]:+.1f}, {hover_latlon[1]:+.1f}"
+                btxt = f"○ {hover_latlon[0]:+.1f}, {hover_latlon[1]:+.1f} (no watchlist CCY)"
+            # Bottom readout (always).
+            dr.text((40, S - 28), btxt, fill=(125, 249, 255))
+            # Top banner with solid bg so the name is unmissable.
+            try:
+                bb = dr.textbbox((0, 0), htxt)
+                tw, th = bb[2] - bb[0], bb[3] - bb[1]
+            except Exception:
+                tw, th = len(htxt) * 7, 12
+            bx0 = max(4, cx - tw / 2 - 10)
+            by0 = 22.0
+            dr.rectangle([bx0, by0, bx0 + tw + 20, by0 + th + 12],
+                         fill=(0, 20, 26), outline=(125, 249, 255))
+            dr.text((bx0 + 10, by0 + 6), htxt, fill=(125, 249, 255))
+        else:
+            try:
+                htxt0 = getattr(self, "hover_label", "— hover globe —")
+                bb = dr.textbbox((0, 0), htxt0)
+                tw, th = bb[2] - bb[0], bb[3] - bb[1]
+            except Exception:
+                htxt0, tw, th = "— hover globe —", 110, 12
+            bx0 = max(4, cx - tw / 2 - 10)
+            dr.rectangle([bx0, 22.0, bx0 + tw + 20, 22.0 + th + 12],
+                         fill=(0, 0, 0), outline=(60, 60, 60))
+            dr.text((bx0 + 10, 28), htxt0, fill=(110, 110, 110))
 
         m, L = 10, 26
         for (x0, y0, dx, dy) in ((m, m, 1, 1), (S - m, m, -1, 1),
@@ -1990,6 +2158,12 @@ def have_display() -> bool:
 
 def run_gui(utc: bool, use_12h: bool, high_only: bool) -> int:
     import tkinter as tk
+    try:
+        from PIL import ImageTk as _ITK
+        if _ITK is None:
+            raise RuntimeError("ImageTk unavailable (tkinter missing)")
+    except Exception as exc:
+        raise RuntimeError(f"Pillow+tkinter required for GUI: {exc}")
     root = tk.Tk()
     GlobeApp(root, utc=utc, use_12h=use_12h, high_only=high_only)
     root.mainloop()
