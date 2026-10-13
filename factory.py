@@ -20,7 +20,10 @@ Default when a display is available: opens a black HUD window with
     EVERY country under the pointer (all 242 Natural Earth features,
     Africa included) - the country name is revealed
     instantly in a top banner on the globe, in the HOVER side panel,
-    and as bottom-overlay coordinates.  Countries with upcoming
+    and as bottom-overlay coordinates.  ⛶ FULL GLOBE (or F key) opens
+    the same live globe on the whole window - drag/wheel/hover keep
+    working there while timer, panel and log run untouched underneath
+    (ESC closes).  Countries with upcoming
     HIGH-impact ForexFactory news get a palish-red overpaint plus orange
     event spikes; the most imminent event gets a red beam,
   * a scrolling log at the bottom with event details + minutes to release.
@@ -1461,6 +1464,21 @@ class GlobeApp:
         self._globe_oy = 0.0
         self._globe_ww = 500
         self._globe_wh = 500
+        # Full-window globe overlay (EXPAND): same live globe on the whole
+        # window; main timer/side/log keep running untouched underneath.
+        self.expand_win = None
+        self.expand_lbl = None
+        self._exp_photo = None
+        self.exp_hover_xy: tuple[int, int] | None = None
+        self.exp_hover_cur: str | None = None
+        self.exp_hover_iso: str | None = None
+        self.exp_hover_name: str | None = None
+        self.exp_hover_latlon: tuple[float, float] | None = None
+        self.exp_hover_label = "— hover globe —"
+        self._exp_S = 900
+        self._exp_ox = 0.0
+        self._exp_oy = 0.0
+        self._exp_frame = False
         if not HAVE_PIL:
             raise RuntimeError("Pillow is required for the globe (pip install pillow)")
         self._build_ui()
@@ -1534,14 +1552,25 @@ class GlobeApp:
         self.globe_lbl = tk.Label(mid, bg=BG, bd=1, relief="solid",
                                   anchor="center", justify="center")
         self.globe_lbl.pack(side="left", fill="both", expand=True)
-        self.globe_lbl.bind("<ButtonPress-1>", self._drag_start)
-        self.globe_lbl.bind("<B1-Motion>", self._drag_move)
-        self.globe_lbl.bind("<Motion>", self._hover_move)
-        self.globe_lbl.bind("<Leave>", self._hover_leave)
+        self.globe_lbl.bind("<ButtonPress-1>",
+                            lambda e: self._drag_start(e, "main"))
+        self.globe_lbl.bind("<B1-Motion>",
+                            lambda e: self._drag_move(e, "main"))
+        self.globe_lbl.bind("<Motion>",
+                            lambda e: self._hover_move(e, "main"))
+        self.globe_lbl.bind("<Leave>", lambda e: self._hover_leave(e, "main"))
         self.globe_lbl.bind("<MouseWheel>", self._wheel)
         self.globe_lbl.bind("<Button-4>", self._wheel_linux_in)
         self.globe_lbl.bind("<Button-5>", self._wheel_linux_out)
         self.globe_lbl.bind("<Double-Button-1>", lambda e: self._zoom_toggle())
+        r.bind("<Left>", lambda e: self._nudge(8, 0))
+        r.bind("<Right>", lambda e: self._nudge(-8, 0))
+        r.bind("<Up>", lambda e: self._nudge(0, 5))
+        r.bind("<Down>", lambda e: self._nudge(0, -5))
+        r.bind("<space>", lambda e: self._toggle_auto())
+        r.bind("<f>", lambda e: self.toggle_expand())
+        r.bind("<F>", lambda e: self.toggle_expand())
+        r.bind("<Escape>", lambda e: self._close_expand())
         r.bind("<Left>", lambda e: self._nudge(8, 0))
         r.bind("<Right>", lambda e: self._nudge(-8, 0))
         r.bind("<Up>", lambda e: self._nudge(0, 5))
@@ -1603,6 +1632,11 @@ class GlobeApp:
                    width=6).pack(side="left", padx=2)
         self.zoom_lbl = ttk.Label(brow3, text="x1.00")
         self.zoom_lbl.pack(side="left", padx=6)
+        brow4 = ttk.Frame(side)
+        brow4.pack(fill="x", pady=2)
+        self.expand_btn = ttk.Button(brow4, text="⛶ FULL GLOBE",
+                                     command=self.toggle_expand)
+        self.expand_btn.pack(side="left", padx=2)
         ttk.Label(side, text="── HOVER ──", foreground=NEON,
                   font=("Courier New", 10, "bold")).pack(pady=(4, 2))
         self.hover_lbl = tk.Label(side, bg=BG, fg="#7df9ff",
@@ -1763,11 +1797,12 @@ class GlobeApp:
                        anchor="w")
 
 
-    def _drag_start(self, e):
+    def _drag_start(self, e, src: str = "main"):
         self._drag_xy = (e.x, e.y)
+        self._drag_src = src
         self.last_drag = time.monotonic()
 
-    def _drag_move(self, e):
+    def _drag_move(self, e, src: str = "main"):
         if self._drag_xy is None:
             return
         dx = e.x - self._drag_xy[0]
@@ -1776,31 +1811,47 @@ class GlobeApp:
         self.lon0 = (self.lon0 - dx * 0.45) % 360.0
         self.lat0 = max(-60.0, min(60.0, self.lat0 + dy * 0.3))
         self.last_drag = time.monotonic()
-        self.hover_xy = (e.x, e.y)
         # Resolve immediately so the country name follows the cursor
         # while dragging, not one frame later.
         try:
-            self._resolve_hover(self._globe_S, self._globe_ox,
-                                self._globe_oy)
+            if src == "ov":
+                self.exp_hover_xy = (e.x, e.y)
+                self._resolve_expand()
+            else:
+                self.hover_xy = (e.x, e.y)
+                self._resolve_hover(self._globe_S, self._globe_ox,
+                                    self._globe_oy)
         except Exception:
             pass
 
-    def _hover_move(self, e):
-        self.hover_xy = (e.x, e.y)
+    def _hover_move(self, e, src: str = "main"):
         self.last_drag = time.monotonic()
         try:
-            self._resolve_hover(self._globe_S, self._globe_ox,
-                                self._globe_oy)
+            if src == "ov":
+                self.exp_hover_xy = (e.x, e.y)
+                self._resolve_expand()
+            else:
+                self.hover_xy = (e.x, e.y)
+                self._resolve_hover(self._globe_S, self._globe_ox,
+                                    self._globe_oy)
         except Exception:
             pass
 
-    def _hover_leave(self, _e):
-        self.hover_xy = None
-        self.hover_cur = None
-        self.hover_iso = None
-        self.hover_name = None
-        self.hover_latlon = None
-        self.hover_label = "— hover globe —"
+    def _hover_leave(self, _e, src: str = "main"):
+        if src == "ov":
+            self.exp_hover_xy = None
+            self.exp_hover_cur = None
+            self.exp_hover_iso = None
+            self.exp_hover_name = None
+            self.exp_hover_latlon = None
+            self.exp_hover_label = "— hover globe —"
+        else:
+            self.hover_xy = None
+            self.hover_cur = None
+            self.hover_iso = None
+            self.hover_name = None
+            self.hover_latlon = None
+            self.hover_label = "— hover globe —"
 
     def _invert_project(self, px: float, py: float, cx: float, cy: float,
                         R: float) -> tuple[float, float] | None:
@@ -1824,6 +1875,46 @@ class GlobeApp:
         lon_deg = (math.degrees(lon) + 540) % 360 - 180
         return math.degrees(lat), lon_deg
 
+    def _resolve_point(self, px: float, py: float, S: int,
+                         ox: float = 0.0, oy: float = 0.0):
+        """Widget pixel -> (cur, iso, name, latlon, label).
+
+        Shared core for the boxed globe and the full-window overlay, so
+        hover naming is identical on both.  Pure w.r.t. draw state
+        (reads lon0/lat0/zoom only).
+        """
+        try:
+            _ox, _oy = float(ox), float(oy)
+        except Exception:
+            _ox, _oy = 0.0, 0.0
+        ix = float(px) - _ox
+        iy = float(py) - _oy
+        cx = cy = S / 2.0
+        R = (S / 2.0 - 26) * self.zoom
+        # Outside the square image entirely -> definitely not on globe.
+        if not (0 <= ix < S and 0 <= iy < S):
+            return None, None, None, None, "○ ocean / space"
+        ll = self._invert_project(ix, iy, cx, cy, R)
+        if ll is None:
+            return None, None, None, None, "○ ocean / space"
+        cur = country_at(ll[0], ll[1])
+        if cur is None:
+            # Full world identification: every country incl. Africa.
+            hit = identify_country(ll[0], ll[1])
+            if hit is None:
+                return None, None, None, ll, f"○ {ll[0]:+.1f}°, {ll[1]:+.1f}°"
+            iso, name = hit
+            return (None, iso, name, ll,
+                    f"● {name} ({iso})  ({ll[0]:+.1f}°, {ll[1]:+.1f}°)")
+        _la, _lo, _r, name = COUNTRIES[cur]
+        try:
+            hit = identify_country(ll[0], ll[1])
+        except Exception:
+            hit = None
+        iso, nm = hit if hit is not None else (cur, name)
+        return (cur, iso, nm, ll,
+                f"▶ {cur} {name}  ({ll[0]:+.1f}°, {ll[1]:+.1f}°)")
+
     def _resolve_hover(self, S: int, ox: float = 0.0, oy: float = 0.0):
         """Refresh hover country from last pointer pixel + current rotation.
 
@@ -1841,55 +1932,31 @@ class GlobeApp:
             self.hover_label = "— hover globe —"
             return
         # Back-compat: _resolve_hover(S) called from old code / tests.
-        try:
-            _ox, _oy = float(ox), float(oy)
-        except Exception:
-            _ox, _oy = 0.0, 0.0
-        ix = float(self.hover_xy[0]) - _ox
-        iy = float(self.hover_xy[1]) - _oy
-        cx = cy = S / 2.0
-        R = (S / 2.0 - 26) * self.zoom
-        # Outside the square image entirely -> definitely not on globe.
-        if not (0 <= ix < S and 0 <= iy < S):
-            self.hover_cur = None
-            self.hover_iso = None
-            self.hover_name = None
-            self.hover_latlon = None
-            self.hover_label = "○ ocean / space"
-            return
-        ll = self._invert_project(ix, iy, cx, cy, R)
-        if ll is None:
-            self.hover_cur = None
-            self.hover_iso = None
-            self.hover_name = None
-            self.hover_latlon = None
-            self.hover_label = "○ ocean / space"
-            return
-        self.hover_latlon = ll
-        cur = country_at(ll[0], ll[1])
+        cur, iso, name, ll, label = self._resolve_point(
+            float(self.hover_xy[0]), float(self.hover_xy[1]), S, ox, oy)
         self.hover_cur = cur
-        if cur is None:
-            # Full world identification: every country incl. Africa.
-            hit = identify_country(ll[0], ll[1])
-            if hit is None:
-                self.hover_iso = None
-                self.hover_name = None
-                self.hover_label = (f"○ {ll[0]:+.1f}°, {ll[1]:+.1f}°")
-            else:
-                self.hover_iso, self.hover_name = hit
-                self.hover_label = (f"● {hit[1]} ({hit[0]})  "
-                                    f"({ll[0]:+.1f}°, {ll[1]:+.1f}°)")
-        else:
-            _la, _lo, _r, name = COUNTRIES[cur]
-            try:
-                hit = identify_country(ll[0], ll[1])
-            except Exception:
-                hit = None
-            if hit is not None:
-                self.hover_iso, self.hover_name = hit
-            else:
-                self.hover_iso, self.hover_name = cur, name
-            self.hover_label = f"▶ {cur} {name}  ({ll[0]:+.1f}°, {ll[1]:+.1f}°)"
+        self.hover_iso = iso
+        self.hover_name = name
+        self.hover_latlon = ll
+        self.hover_label = label
+
+    def _resolve_expand(self):
+        """Refresh overlay hover from last overlay pointer pixel."""
+        if self.exp_hover_xy is None:
+            self.exp_hover_cur = None
+            self.exp_hover_iso = None
+            self.exp_hover_name = None
+            self.exp_hover_latlon = None
+            self.exp_hover_label = "— hover globe —"
+            return
+        cur, iso, name, ll, label = self._resolve_point(
+            float(self.exp_hover_xy[0]), float(self.exp_hover_xy[1]),
+            self._exp_S, self._exp_ox, self._exp_oy)
+        self.exp_hover_cur = cur
+        self.exp_hover_iso = iso
+        self.exp_hover_name = name
+        self.exp_hover_latlon = ll
+        self.exp_hover_label = label
 
     ZOOM_MIN = 0.5
     ZOOM_MAX = 5.0
@@ -1917,26 +1984,35 @@ class GlobeApp:
         self.zoom = 2.6 if self.zoom < 1.8 else 1.0
         self.last_drag = time.monotonic()
 
-    def _wheel(self, e):
+    def _wheel(self, e, src: str = "main"):
         try:
-            self.hover_xy = (e.x, e.y)
+            if src == "ov":
+                self.exp_hover_xy = (e.x, e.y)
+            else:
+                self.hover_xy = (e.x, e.y)
         except Exception:
             pass
         self._zoom(self.ZOOM_STEP if getattr(e, "delta", 0) > 0
                    else 1 / self.ZOOM_STEP)
         self.last_drag = time.monotonic()
 
-    def _wheel_linux_in(self, e):
+    def _wheel_linux_in(self, e, src: str = "main"):
         try:
-            self.hover_xy = (e.x, e.y)
+            if src == "ov":
+                self.exp_hover_xy = (e.x, e.y)
+            else:
+                self.hover_xy = (e.x, e.y)
         except Exception:
             pass
         self._zoom(self.ZOOM_STEP)
         self.last_drag = time.monotonic()
 
-    def _wheel_linux_out(self, e):
+    def _wheel_linux_out(self, e, src: str = "main"):
         try:
-            self.hover_xy = (e.x, e.y)
+            if src == "ov":
+                self.exp_hover_xy = (e.x, e.y)
+            else:
+                self.hover_xy = (e.x, e.y)
         except Exception:
             pass
         self._zoom(1 / self.ZOOM_STEP)
@@ -2008,8 +2084,11 @@ class GlobeApp:
             wh = max(1, self.globe_lbl.winfo_height())
         except Exception:
             ww, wh = 500, 500
-        w = max(420, ww - 4)
-        S = min(500, max(380, w))
+        # Globe fills its whole pane (not a fixed 500px box): S follows
+        # the widget's smaller side so zoom uses all available space.
+        S = max(300, min(ww - 8, wh - 8))
+        if S > 900:
+            S = 900
         # PhotoImage is CENTERED in the Label: remember the offset so
         # hover pixels map exactly onto globe pixels (the hover fix).
         ox = max(0.0, (ww - S) / 2.0)
@@ -2024,9 +2103,166 @@ class GlobeApp:
         self._photo = ImageTk.PhotoImage(img)
         self.globe_lbl.configure(image=self._photo)
         self._update_side(events, now)
+        # Full-window overlay shares the same live state; render it on
+        # alternating ticks so two big surfaces don't halve the fps.
+        try:
+            if self.expand_win is not None and self.expand_lbl is not None:
+                try:
+                    self.expand_win.winfo_exists()
+                except Exception:
+                    self.expand_win = None
+                    self.expand_lbl = None
+                else:
+                    self._exp_frame = not self._exp_frame
+                    if self._exp_frame:
+                        self._draw_expand(events, now)
+        except Exception:
+            pass
 
-    def render_globe(self, events, now, S: int = 500):
-        """Pure render of the dotted globe -> PIL Image (headless-friendly)."""
+    def toggle_expand(self):
+        """Open/close the full-window globe overlay.
+
+        The overlay shows the same live globe (spin/zoom/hover/country
+        names) on the whole window; timer, side panel and log keep
+        running untouched underneath and are restored on close.
+        """
+        import tkinter as tk
+        try:
+            if self.expand_win is not None:
+                self._close_expand()
+                return
+            tw = tk.Toplevel(self.root)
+            tw.configure(bg=BG)
+            try:
+                tw.overrideredirect(True)
+            except Exception:
+                pass
+            try:
+                self.root.update_idletasks()
+                x = self.root.winfo_rootx()
+                y = self.root.winfo_rooty()
+                w = max(400, self.root.winfo_width())
+                h = max(400, self.root.winfo_height())
+                tw.geometry(f"{w}x{h}+{x}+{y}")
+            except Exception:
+                pass
+            try:
+                tw.transient(self.root)
+            except Exception:
+                pass
+            top = tk.Frame(tw, bg=BG)
+            top.pack(fill="x", padx=10, pady=(8, 0))
+            tk.Label(top, text="◤ FULL GLOBE — drag to spin · wheel to zoom · "
+                     "ESC / F to exit ◥",
+                     bg=BG, fg=NEON,
+                     font=("Courier New", 11, "bold")).pack(side="left")
+            tk.Button(top, text="✕ CLOSE", bg="#0d0d0d", fg=NEON,
+                      activebackground="#062b30", relief="solid", bd=1,
+                      font=("Courier New", 9, "bold"),
+                      command=self._close_expand).pack(side="right")
+            lbl = tk.Label(tw, bg=BG, bd=1, relief="solid", anchor="center")
+            lbl.pack(fill="both", expand=True, padx=10, pady=10)
+            lbl.bind("<ButtonPress-1>",
+                     lambda e: self._drag_start(e, "ov"))
+            lbl.bind("<B1-Motion>", lambda e: self._drag_move(e, "ov"))
+            lbl.bind("<Motion>", lambda e: self._hover_move(e, "ov"))
+            lbl.bind("<Leave>", lambda e: self._hover_leave(e, "ov"))
+            lbl.bind("<MouseWheel>", lambda e: self._wheel(e, "ov"))
+            lbl.bind("<Button-4>", lambda e: self._wheel_linux_in(e, "ov"))
+            lbl.bind("<Button-5>", lambda e: self._wheel_linux_out(e, "ov"))
+            lbl.bind("<Double-Button-1>", lambda e: self._zoom_toggle())
+            tw.bind("<Escape>", lambda e: self._close_expand())
+            tw.bind("<f>", lambda e: self._close_expand())
+            tw.bind("<F>", lambda e: self._close_expand())
+            tw.protocol("WM_DELETE_WINDOW", self._close_expand)
+            self.expand_win = tw
+            self.expand_lbl = lbl
+            self.exp_hover_xy = None
+            try:
+                self.expand_btn.configure(text="■ DOCK")
+            except Exception:
+                pass
+            try:
+                tw.focus_force()
+            except Exception:
+                pass
+        except Exception:
+            try:
+                self.expand_win = None
+                self.expand_lbl = None
+            except Exception:
+                pass
+
+    def _close_expand(self):
+        try:
+            if self.expand_win is not None:
+                self.expand_win.destroy()
+        except Exception:
+            pass
+        self.expand_win = None
+        self.expand_lbl = None
+        self._exp_photo = None
+        self.exp_hover_xy = None
+        self.exp_hover_cur = None
+        self.exp_hover_iso = None
+        self.exp_hover_name = None
+        self.exp_hover_latlon = None
+        self.exp_hover_label = "— hover globe —"
+        try:
+            self.expand_btn.configure(text="⛶ FULL GLOBE")
+        except Exception:
+            pass
+        try:
+            self.root.focus_force()
+        except Exception:
+            pass
+
+    def _draw_expand(self, events, now):
+        """Render the live globe onto the full-window overlay label."""
+        try:
+            ww = max(1, self.expand_lbl.winfo_width())
+            wh = max(1, self.expand_lbl.winfo_height())
+        except Exception:
+            return
+        S = max(300, min(ww - 8, wh - 8))
+        if S > 1100:
+            S = 1100
+        ox = max(0.0, (ww - S) / 2.0)
+        oy = max(0.0, (wh - S) / 2.0)
+        self._exp_S = S
+        self._exp_ox = ox
+        self._exp_oy = oy
+        # Resolve overlay hover (own pointer pixels, shared globe state).
+        if self.exp_hover_xy is None:
+            self.exp_hover_cur = None
+            self.exp_hover_iso = None
+            self.exp_hover_name = None
+            self.exp_hover_latlon = None
+            self.exp_hover_label = "— hover globe —"
+        else:
+            cur, iso, name, ll, label = self._resolve_point(
+                float(self.exp_hover_xy[0]), float(self.exp_hover_xy[1]),
+                S, ox, oy)
+            self.exp_hover_cur = cur
+            self.exp_hover_iso = iso
+            self.exp_hover_name = name
+            self.exp_hover_latlon = ll
+            self.exp_hover_label = label
+        img = self.render_globe(
+            events, now, S,
+            hover=(self.exp_hover_cur, self.exp_hover_iso,
+                   self.exp_hover_name, self.exp_hover_latlon,
+                   self.exp_hover_label))
+        self._exp_photo = ImageTk.PhotoImage(img)
+        self.expand_lbl.configure(image=self._exp_photo)
+
+    def render_globe(self, events, now, S: int = 500, hover=None):
+        """Pure render of the dotted globe -> PIL Image (headless-friendly).
+
+        `hover` is an optional (cur, iso, name, latlon, label) tuple for
+        the surface being drawn (boxed globe vs full-window overlay).
+        When None the app's main hover attrs are used (back-compat).
+        """
         alerts = self._alerts(events, now)
         nxt = self._next_event(events, now)
         img = Image.new("RGB", (S, S), (0, 0, 0))
@@ -2084,7 +2320,13 @@ class GlobeApp:
 
         imminent_cur = nxt["currency"] if nxt else None
 
-        hover_cur = getattr(self, "hover_cur", None)
+        if hover is None:
+            hover = (getattr(self, "hover_cur", None),
+                     getattr(self, "hover_iso", None),
+                     getattr(self, "hover_name", None),
+                     getattr(self, "hover_latlon", None),
+                     getattr(self, "hover_label", "— hover globe —"))
+        hover_cur, hover_iso, hover_name, hover_latlon, hover_label = hover
 
         if HAVE_NP and D_SIN_LA is not None:
             self._draw_dots_fast(img, alerts, imminent_cur, hover_cur,
@@ -2095,7 +2337,8 @@ class GlobeApp:
 
         # Accurate country borders (all countries) over the dots.
         try:
-            self._draw_borders(dr, alerts, cx, cy, R)
+            self._draw_borders(dr, alerts, cx, cy, R,
+                               hover_iso=hover_iso, hover_cur=hover_cur)
         except Exception:
             pass
 
@@ -2148,10 +2391,6 @@ class GlobeApp:
         # Natural Earth features, Africa included) under the pointer while
         # scrolling/dragging.  Top banner + crosshair at the exact pointer
         # + bottom readout + HOVER side panel.
-        hover_cur = getattr(self, "hover_cur", None)
-        hover_latlon = getattr(self, "hover_latlon", None)
-        hover_iso = getattr(self, "hover_iso", None)
-        hover_name = getattr(self, "hover_name", None)
         if hover_cur is not None and hover_cur in COUNTRIES:
             cc = COUNTRIES[hover_cur]
             pr = self._project(cc[0], cc[1], cx, cy, R)
@@ -2199,7 +2438,7 @@ class GlobeApp:
             dr.text((bx0 + 10, by0 + 6), htxt, fill=(125, 249, 255))
         else:
             try:
-                htxt0 = getattr(self, "hover_label", "— hover globe —")
+                htxt0 = hover_label or "— hover globe —"
                 bb = dr.textbbox((0, 0), htxt0)
                 tw, th = bb[2] - bb[0], bb[3] - bb[1]
             except Exception:
@@ -2222,20 +2461,26 @@ class GlobeApp:
                 fill=(90, 90, 90))
         return img
 
+    _SELF_HOVER = object()
+
     def _draw_borders(self, dr, alerts, cx: float, cy: float,
-                      R: float) -> None:
+                      R: float, hover_iso=_SELF_HOVER,
+                      hover_cur=_SELF_HOVER) -> None:
         """Draw accurate Natural Earth borders for every country.
 
         Base borders dim grey; watchlist currencies with active HIGH-impact
         alerts get a pale-red tint; the hovered country (any of the 242,
         Africa included) gets a cyan highlight.  Back hemisphere segments
         are clipped per-sample (cos_c > 0.02), like the graticule.
+        hover_iso/hover_cur default to the main surface's hover state.
         """
         _ensure_borders()
         if not BORDERS:
             return
-        hover_iso = getattr(self, "hover_iso", None)
-        hover_cur = getattr(self, "hover_cur", None)
+        if hover_iso is self._SELF_HOVER:
+            hover_iso = getattr(self, "hover_iso", None)
+        if hover_cur is self._SELF_HOVER:
+            hover_cur = getattr(self, "hover_cur", None)
         alert_ccys = set(alerts) if alerts else set()
         try:
             zoom = float(getattr(self, "zoom", 1.0))
@@ -2452,8 +2697,12 @@ class GlobeApp:
                  f"{MAP_SOURCE} · "
                  f"{'AUTO-SPIN' if self.auto else 'HELD'}")
         try:
-            self.hover_lbl.configure(text=getattr(self, "hover_label",
-                                                  "— hover globe —"))
+            if (self.expand_win is not None
+                    and self.exp_hover_xy is not None):
+                htext = self.exp_hover_label
+            else:
+                htext = getattr(self, "hover_label", "— hover globe —")
+            self.hover_lbl.configure(text=htext)
         except Exception:
             pass
         try:
