@@ -16,8 +16,9 @@ Default when a display is available: opens a black HUD window with
     (HR:MN + small SEC / MS / US, AM/PM, date line),
   * a dense dotted world globe like the ``inspo`` dashboard (10x dot
     density vs the old sparse version for high map contrast).  Drag it
-    to spin it (scrollable).  Hover / scroll over the globe to highlight
-    which country is under the pointer - the country name is revealed
+    to spin it (scrollable).  Hover / scroll over the globe to name
+    EVERY country under the pointer (all 242 Natural Earth features,
+    Africa included) - the country name is revealed
     instantly in a top banner on the globe, in the HOVER side panel,
     and as bottom-overlay coordinates.  Countries with upcoming
     HIGH-impact ForexFactory news get a palish-red overpaint plus orange
@@ -966,6 +967,114 @@ def country_at(lat: float, lon: float) -> str | None:
     return best2
 
 
+# --- Full world country identification (every country, incl. Africa). ---
+# Watchlist above covers 9 forex currencies; hover must NAME any land
+# point.  Built from the same Natural Earth 50m admin-0 file (242
+# features) already downloaded for the globe - no extra config.
+FULL_GEO: list = []  # [(iso, name, geom, bounds)]
+_FULL_GEO_TRIED = False
+
+
+def _load_full_geo_only() -> None:
+    """Load every Natural Earth country geometry (lazy, once)."""
+    global FULL_GEO
+    if FULL_GEO or not _have_shapely():
+        return
+    try:
+        from shapely.geometry import shape
+        paths = ensure_map_files()
+        if not paths["cty"]:
+            return
+        with open(paths["cty"]) as f:  # type: ignore
+            fc = json.load(f)
+        items = []
+        for feat in fc.get("features", []):
+            try:
+                pr = feat.get("properties", {})
+                iso = (pr.get("ADM0_A3") or pr.get("ISO_A3")
+                       or pr.get("GU_A3") or "").strip() or "???"
+                name = (pr.get("ADMIN") or pr.get("NAME_LONG")
+                        or pr.get("NAME") or iso).strip()
+                g = shape(feat["geometry"])
+                if g.is_empty:
+                    continue
+                try:
+                    if not g.is_valid:
+                        g = g.buffer(0)
+                except Exception:
+                    pass
+                if g.is_empty:
+                    continue
+                items.append((iso, name, g, g.bounds))
+            except Exception:
+                continue
+        FULL_GEO = items
+    except Exception:
+        pass
+
+
+def _ensure_full_geo() -> None:
+    """Lazy one-time full-world load (first hover, not import)."""
+    global _FULL_GEO_TRIED
+    if FULL_GEO or _FULL_GEO_TRIED or not _have_shapely():
+        return
+    _FULL_GEO_TRIED = True
+    _load_full_geo_only()
+
+
+def identify_country(lat: float, lon: float) -> tuple[str, str] | None:
+    """Return (ISO_A3, name) of the country containing (lat, lon).
+
+    Polygon-accurate over all 242 Natural Earth admin-0 features
+    (covers every African country, etc.).  Smallest containing geometry
+    wins (handles enclaves, e.g. Lesotho inside South Africa).
+    Returns None for ocean/space or when map data is unavailable.
+    """
+    if not FULL_GEO:
+        _ensure_full_geo()
+    if not FULL_GEO:
+        return None
+    try:
+        from shapely.geometry import Point
+        pt = Point(lon, lat)
+        best = None
+        best_area = float("inf")
+        for iso, name, g, b in FULL_GEO:
+            try:
+                if not (b[0] - 0.5 <= lon <= b[2] + 0.5 and
+                        b[1] - 0.5 <= lat <= b[3] + 0.5):
+                    continue
+                if g.contains(pt) and g.area < best_area:
+                    best, best_area = (iso, name), g.area
+            except Exception:
+                continue
+        if best is not None:
+            return best
+        # Coastal tolerance: 50m coastlines put peninsulas/city tips
+        # (Manhattan, Dakar, ...) a fraction of a degree offshore.
+        # Accept the nearest country within ~0.6deg.
+        try:
+            nearest = None
+            nearest_d = float("inf")
+            for iso, name, g, b in FULL_GEO:
+                try:
+                    if not (b[0] - 1.0 <= lon <= b[2] + 1.0 and
+                            b[1] - 1.0 <= lat <= b[3] + 1.0):
+                        continue
+                    d = g.distance(pt)
+                    if d < nearest_d:
+                        nearest, nearest_d = (iso, name), d
+                except Exception:
+                    continue
+            if nearest is not None and nearest_d <= 0.6:
+                return nearest
+        except Exception:
+            pass
+        return None
+    except Exception:
+        return None
+
+
 # Dense dotted globe: dot count scales as 1/step^2, so step 2.0 -> 0.63
 # gives ~10x dots (≈3k -> ≈31k) for much higher map contrast.
 DOT_STEP = 0.63
@@ -1220,8 +1329,12 @@ class GlobeApp:
         self.pulse = 0.0
         self.show_utc_btn = None
         # Hover highlight: last pointer pixel + resolved country.
+        # hover_cur = watchlist currency (alerts); hover_iso/hover_name =
+        # full world identification (every country incl. Africa).
         self.hover_xy: tuple[int, int] | None = None
         self.hover_cur: str | None = None
+        self.hover_iso: str | None = None
+        self.hover_name: str | None = None
         self.hover_latlon: tuple[float, float] | None = None
         self.hover_label = "— hover globe —"
         self._globe_S = 500
@@ -1240,7 +1353,10 @@ class GlobeApp:
         # Preload country polygons off the GUI thread so the very first
         # hover resolves instantly to a real country name (no 1-2s stall).
         try:
-            th = threading.Thread(target=_load_ccy_geo_only, daemon=True)
+            def _preload_geo() -> None:
+                _load_ccy_geo_only()
+                _load_full_geo_only()
+            th = threading.Thread(target=_preload_geo, daemon=True)
             th.start()
         except Exception:
             pass
@@ -1546,6 +1662,8 @@ class GlobeApp:
     def _hover_leave(self, _e):
         self.hover_xy = None
         self.hover_cur = None
+        self.hover_iso = None
+        self.hover_name = None
         self.hover_latlon = None
         self.hover_label = "— hover globe —"
 
@@ -1582,6 +1700,8 @@ class GlobeApp:
         """
         if self.hover_xy is None:
             self.hover_cur = None
+            self.hover_iso = None
+            self.hover_name = None
             self.hover_latlon = None
             self.hover_label = "— hover globe —"
             return
@@ -1597,12 +1717,16 @@ class GlobeApp:
         # Outside the square image entirely -> definitely not on globe.
         if not (0 <= ix < S and 0 <= iy < S):
             self.hover_cur = None
+            self.hover_iso = None
+            self.hover_name = None
             self.hover_latlon = None
             self.hover_label = "○ ocean / space"
             return
         ll = self._invert_project(ix, iy, cx, cy, R)
         if ll is None:
             self.hover_cur = None
+            self.hover_iso = None
+            self.hover_name = None
             self.hover_latlon = None
             self.hover_label = "○ ocean / space"
             return
@@ -1610,9 +1734,26 @@ class GlobeApp:
         cur = country_at(ll[0], ll[1])
         self.hover_cur = cur
         if cur is None:
-            self.hover_label = f"○ {ll[0]:+.1f}°, {ll[1]:+.1f}° (no watchlist CCY)"
+            # Full world identification: every country incl. Africa.
+            hit = identify_country(ll[0], ll[1])
+            if hit is None:
+                self.hover_iso = None
+                self.hover_name = None
+                self.hover_label = (f"○ {ll[0]:+.1f}°, {ll[1]:+.1f}°")
+            else:
+                self.hover_iso, self.hover_name = hit
+                self.hover_label = (f"● {hit[1]} ({hit[0]})  "
+                                    f"({ll[0]:+.1f}°, {ll[1]:+.1f}°)")
         else:
             _la, _lo, _r, name = COUNTRIES[cur]
+            try:
+                hit = identify_country(ll[0], ll[1])
+            except Exception:
+                hit = None
+            if hit is not None:
+                self.hover_iso, self.hover_name = hit
+            else:
+                self.hover_iso, self.hover_name = cur, name
             self.hover_label = f"▶ {cur} {name}  ({ll[0]:+.1f}°, {ll[1]:+.1f}°)"
 
     def _zoom(self, f: float):
@@ -1838,12 +1979,14 @@ class GlobeApp:
                         dr.line([pts[sgm], pts[sgm + 1]],
                                 fill=(120, 120, 120))
 
-        # Hover highlight ring + label: shows exactly which watchlist
-        # country the pointer is over while scrolling/dragging.  The
-        # country NAME is always revealed: top banner + crosshair at the
-        # exact pointer + bottom readout + HOVER side panel.
+        # Hover highlight ring + label: names EVERY country (all 242
+        # Natural Earth features, Africa included) under the pointer while
+        # scrolling/dragging.  Top banner + crosshair at the exact pointer
+        # + bottom readout + HOVER side panel.
         hover_cur = getattr(self, "hover_cur", None)
         hover_latlon = getattr(self, "hover_latlon", None)
+        hover_iso = getattr(self, "hover_iso", None)
+        hover_name = getattr(self, "hover_name", None)
         if hover_cur is not None and hover_cur in COUNTRIES:
             cc = COUNTRIES[hover_cur]
             pr = self._project(cc[0], cc[1], cx, cy, R)
@@ -1869,9 +2012,13 @@ class GlobeApp:
                 htxt = f"▶ {hover_cur} {COUNTRIES[hover_cur][3]}"
                 btxt = (f"▶ {hover_cur} {COUNTRIES[hover_cur][3]}  "
                         f"({hover_latlon[0]:+.1f}, {hover_latlon[1]:+.1f})")
+            elif hover_name:
+                htxt = f"● {hover_name}" + (f" ({hover_iso})" if hover_iso else "")
+                btxt = (f"● {hover_name}" + (f" ({hover_iso})" if hover_iso else "") +
+                        f"  ({hover_latlon[0]:+.1f}, {hover_latlon[1]:+.1f})")
             else:
                 htxt = f"○ {hover_latlon[0]:+.1f}, {hover_latlon[1]:+.1f}"
-                btxt = f"○ {hover_latlon[0]:+.1f}, {hover_latlon[1]:+.1f} (no watchlist CCY)"
+                btxt = f"○ {hover_latlon[0]:+.1f}, {hover_latlon[1]:+.1f}"
             # Bottom readout (always).
             dr.text((40, S - 28), btxt, fill=(125, 249, 255))
             # Top banner with solid bg so the name is unmissable.
