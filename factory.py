@@ -12,7 +12,7 @@ No keys, env vars, or manual pip steps. Missing wheels
 
 Default when a display is available: opens a black HUD window with
 
-  * a big glowing-green 7-segment clock like the ``inspo2`` timer
+  * a big glowing-cyan 7-segment clock like the ``inspo2`` timer
     (HR:MN + small SEC / MS / US, AM/PM, date line),
   * a dense dotted world globe like the ``inspo`` dashboard (10x dot
     density vs the old sparse version for high map contrast).  Drag it
@@ -1318,9 +1318,9 @@ def _project_dots(lon0: float, lat0: float):
     return x, y, cos_c, depth
 
 
-NEON = "#39ff14"
-NEON_DIM = "#0a5c00"
-NEON_FAINT = "#062d02"
+NEON = "#00e5ff"
+NEON_DIM = "#00707f"
+NEON_FAINT = "#06333a"
 TIMER = "#ffffff"
 TIMER_GLOW = "#6e6e6e"
 TIMER_FAINT = "#1f1f1f"
@@ -1362,7 +1362,7 @@ def _vpoly(x: float, y: float, L: float, T: float) -> list[float]:
 
 
 class SevenSeg:
-    """Glowing-green 7-segment digit renderer on a tkinter Canvas."""
+    """Glowing-cyan 7-segment digit renderer on a tkinter Canvas."""
 
     def __init__(self, canvas, glow: bool = True):
         self.cv = canvas
@@ -1509,7 +1509,7 @@ class GlobeApp:
         style.configure("TButton", background="#0d0d0d", foreground=NEON,
                         font=("Courier New", 9, "bold"),
                         borderwidth=1, relief="solid")
-        style.map("TButton", background=[("active", "#0f2a0f")])
+        style.map("TButton", background=[("active", "#062b30")])
         style.configure("TCheckbutton", background=BG, foreground="#9a9a9a",
                         font=("Courier New", 9))
 
