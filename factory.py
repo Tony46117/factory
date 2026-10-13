@@ -1352,13 +1352,6 @@ class GlobeApp:
         ttk.Checkbutton(brow2, text="High only", variable=self.hivar,
                         command=self._toggle_filter).pack(side="left",
                                                           padx=6)
-        ttk.Label(side, wraplength=280, justify="left",
-                  text="drag globe to scroll - hover highlights country - wheel = zoom - arrows = rotate - space = pause",
-                  font=("Courier New", 8)).pack(pady=4)
-        self.legend = tk.Label(side, bg=BG, fg="#9a9a9a",
-                               font=("Courier New", 9), justify="left",
-                               text="* grey = land\n* pale-red = HIGH news <48h\n* orange spike = event count\n* red beam = next release")
-        self.legend.pack(anchor="w")
         ttk.Label(side, text="── HOVER ──", foreground=NEON,
                   font=("Courier New", 10, "bold")).pack(pady=(4, 2))
         self.hover_lbl = tk.Label(side, bg=BG, fg="#7df9ff",
