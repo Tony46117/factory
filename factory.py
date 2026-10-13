@@ -19,6 +19,11 @@ when a key is available (see ``apis.txt`` / ``GOOGLE_MAPS_API_KEY``).
 Note: tkinter/PIL cannot embed the Google Maps 3D JavaScript globe
 directly, so the key is used for geocoding accuracy, not tile rendering.
 
+Coastlines and borders come from Natural Earth 50m land + 50m admin-0
+countries (public domain, https://www.naturalearthdata.com), downloaded
+once and cached - every line on the map is real survey-grade geometry,
+not hand polygons.  Rendering is numpy-vectorized (~4ms/frame).
+
 Live data comes from the ForexFactory-compatible feed
 (https://nfs.faireconomy.media/ff_calendar_{thisweek,nextweek}.json)
 with an offline fallback built from news/high_impact_events_calendar.csv.
@@ -56,6 +61,26 @@ try:
     HAVE_PIL = True
 except Exception:
     HAVE_PIL = False
+
+try:
+    import numpy as np
+    HAVE_NP = True
+except Exception:
+    np = None  # type: ignore
+    HAVE_NP = False
+
+try:
+    import urllib.request as _urlreq
+except Exception:
+    _urlreq = None  # type: ignore
+
+
+def _have_shapely() -> bool:
+    try:
+        import shapely  # noqa: F401
+        return True
+    except Exception:
+        return False
 
 
 BOLD_WHITE = "\033[1;97m"
@@ -224,7 +249,8 @@ GEOCODE_CACHE = os.path.expanduser("~/.cache/forex_globe_geocode.json")
 
 def refine_countries_with_google(
         countries: dict[str, tuple[float, float, float, str]],
-        timeout: float = 6.0) -> dict[str, tuple[float, float, float, str]]:
+        timeout: float = 6.0,
+        _cache_only: bool = False) -> dict[str, tuple[float, float, float, str]]:
     """Verify lat/lon centroids via Google Geocoding API if key exists.
 
     Returns a (possibly updated) dict; never raises.  Results are cached
@@ -236,6 +262,8 @@ def refine_countries_with_google(
     would push London outside the hover radius).  In that case the cached
     Google value is kept for reference but the built-in center wins, so
     hover stays accurate.
+
+    With _cache_only=True no network is touched (instant; safe at import).
     """
     if GOOGLE_MAPS_KEY is None or requests is None:
         return countries
@@ -257,6 +285,8 @@ def refine_countries_with_google(
     for cur, q in queries.items():
         if cur in cached:
             lat, lon = cached[cur]
+        elif _cache_only:
+            continue
         else:
             try:
                 r = requests.get(
@@ -313,9 +343,32 @@ COUNTRIES: dict[str, tuple[float, float, float, str]] = {
 }
 
 try:
-    COUNTRIES = refine_countries_with_google(COUNTRIES)
+    COUNTRIES = refine_countries_with_google(COUNTRIES, _cache_only=True)
 except Exception:
     pass
+
+
+def schedule_google_refresh(delay_s: float = 2.0) -> None:
+    """Refresh centroids via Google Geocoding in a daemon thread (non-blocking).
+
+    Called once when the GUI starts; never blocks import or --once.
+    Updates COUNTRIES in place plus the DOT overlay index if it changes.
+    """
+    if GOOGLE_MAPS_KEY is None or requests is None:
+        return
+
+    def _job() -> None:
+        try:
+            time.sleep(delay_s)
+            updated = refine_countries_with_google(dict(COUNTRIES))
+            if updated != COUNTRIES:
+                COUNTRIES.clear()
+                COUNTRIES.update(updated)
+        except Exception:
+            pass
+
+    th = threading.Thread(target=_job, daemon=True)
+    th.start()
 
 
 # Extra metro circles for accurate hover on large countries.  Primary
@@ -556,18 +609,296 @@ def ang_dist_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return math.degrees(math.acos(c))
 
 
-def country_at(lat: float, lon: float) -> str | None:
-    """Return currency code whose hit-radius contains (lat, lon), else None.
+# ---------------------------------------------------------------------------
+# Accurate map engine (Natural Earth 50m land + 50m countries).
+# Coastlines/borders come from real map sources, not hand polygons:
+#   https://www.naturalearthdata.com  (public domain, © Natural Earth)
+# Files are downloaded once into ~/.cache/forex_globe_maps and the built
+# dot lattice is cached as .npz, so startup is milliseconds after first run.
+# Without network/shapely/numpy the coarse built-in fallback is used.
+# ---------------------------------------------------------------------------
+MAP_DIR = os.path.expanduser("~/.cache/forex_globe_maps")
+NE_LAND_URL = ("https://raw.githubusercontent.com/nvkelso/natural-earth-vector"
+               "/master/geojson/ne_50m_land.geojson")
+NE_CTY_URL = ("https://raw.githubusercontent.com/nvkelso/natural-earth-vector"
+              "/master/geojson/ne_50m_admin_0_countries.geojson")
+NE_CTY110_URL = ("https://raw.githubusercontent.com/nvkelso/natural-earth-vector"
+                 "/master/geojson/ne_110m_admin_0_countries.geojson")
+DOTS_CACHE = os.path.join(MAP_DIR, "dots_0.63_50m.npz")
 
-    Checks primary COUNTRIES circles plus EXTRA_CENTERS metro circles.
-    Picks the closest matching country when radii overlap (e.g. EUR/GBP/CHF).
+# Watchlist ISO A3 codes per currency (Natural Earth ADM0_A3).
+EUROZONE_ISO = {"DEU", "FRA", "ITA", "ESP", "NLD", "BEL", "AUT", "IRL",
+                "PRT", "FIN", "GRC", "SVK", "SVN", "EST", "LVA", "LTU",
+                "HRV", "CYP", "MLT", "LUX"}
+WATCH_ISO: dict[str, list[str]] = {
+    "USD": ["USA"], "CAD": ["CAN"], "EUR": sorted(EUROZONE_ISO),
+    "GBP": ["GBR"], "CHF": ["CHE"], "JPY": ["JPN"], "CNY": ["CHN"],
+    "AUD": ["AUS"], "NZD": ["NZL"],
+}
+CCY_LIST: list[str] = ["USD", "CAD", "EUR", "GBP", "CHF", "JPY",
+                       "CNY", "AUD", "NZD"]
+
+# Per-currency shapely unions for polygon-accurate hover/overpaint.
+# (None when maps unavailable -> circle fallback in country_at.)
+CCY_GEO: dict[str, object] = {}
+MAP_SOURCE = "built-in coarse"
+
+
+def _download(url: str, dest: str, timeout: float = 60.0) -> bool:
+    try:
+        if os.path.exists(dest) and os.path.getsize(dest) > 10_000:
+            return True
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        tmp = dest + ".tmp"
+        if requests is not None:
+            with requests.get(url, timeout=timeout, stream=True) as r:
+                r.raise_for_status()
+                with open(tmp, "wb") as f:
+                    for chunk in r.iter_content(1 << 16):
+                        if chunk:
+                            f.write(chunk)
+        elif _urlreq is not None:
+            _urlreq.urlretrieve(url, tmp)
+        else:
+            return False
+        if os.path.getsize(tmp) > 10_000:
+            os.replace(tmp, dest)
+            return True
+    except Exception:
+        pass
+    try:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    except Exception:
+        pass
+    return os.path.exists(dest)
+
+
+def ensure_map_files() -> dict[str, str | None]:
+    """Download (once) land + country GeoJSON.  Returns paths (None if failed)."""
+    land = os.path.join(MAP_DIR, "ne_50m_land.geojson")
+    cty = os.path.join(MAP_DIR, "ne_50m_countries.geojson")
+    cty110 = os.path.join(MAP_DIR, "ne_110m_countries.geojson")
+    ok_land = _download(NE_LAND_URL, land)
+    ok_cty = _download(NE_CTY_URL, cty)
+    if not ok_cty:
+        ok_cty = _download(NE_CTY110_URL, cty110)
+        cty = cty110 if ok_cty else None  # type: ignore
+    return {"land": land if ok_land else None,
+            "cty": cty if ok_cty else None}
+
+
+def _ccy_unions(cty_path: str) -> dict[str, object]:
+    """Build per-currency shapely unions from a countries GeoJSON file."""
+    from shapely.geometry import shape, box
+    from shapely.ops import unary_union
+    with open(cty_path) as f:
+        fc = json.load(f)
+
+    def _iso(feat) -> str:
+        p = feat.get("properties", {})
+        return p.get("ADM0_A3") or p.get("ISO_A3") or ""
+
+    europe = box(-11.0, 34.5, 35.0, 72.0)
+    out: dict[str, object] = {}
+    for cur, codes in WATCH_ISO.items():
+        gs = []
+        for feat in fc["features"]:
+            code = _iso(feat)
+            if code not in codes:
+                continue
+            try:
+                g = shape(feat["geometry"])
+            except Exception:
+                continue
+            if g.is_empty:
+                continue
+            if code == "FRA":  # keep metropolitan France only (drop Guiana)
+                try:
+                    g = g.intersection(europe)
+                except Exception:
+                    pass
+                if g.is_empty:
+                    continue
+            gs.append(g)
+        if gs:
+            try:
+                out[cur] = unary_union(gs)
+            except Exception:
+                pass
+    return out
+
+
+def build_accurate_dots(
+        step: float = 0.63) -> tuple[list[tuple[float, float]],
+                                     list[str | None], str]:
+    """Build (dots, country-per-dot) from Natural Earth polygons.
+
+    Returns (dots, ccy_labels, source_label).  Raises on any failure so
+    callers can fall back to the coarse builder.
     """
-    best: str | None = None
+    from shapely.geometry import shape
+    from shapely.ops import unary_union
+    from shapely import contains_xy
+    paths = ensure_map_files()
+    if not paths["land"] or not paths["cty"]:
+        raise RuntimeError("map files unavailable")
+    with open(paths["land"]) as f:  # type: ignore
+        land_fc = json.load(f)
+    union = unary_union([shape(feat["geometry"])
+                         for feat in land_fc["features"]])
+    if HAVE_NP and np is not None:
+        lats = np.arange(-60.0, 78.0001, step)
+        lons = np.arange(-180.0, 180.0, step)
+        Lon, Lat = np.meshgrid(lons, lats)
+        Lon = Lon + (step / 2.0) * ((np.arange(len(lats))[:, None]) % 2)
+        keep = contains_xy(union, Lon.ravel(), Lat.ravel()).reshape(Lon.shape)
+        dla, dlo = Lat[keep], Lon[keep]
+    else:
+        dla_list, dlo_list = [], []
+        lat = -60.0
+        row = 0
+        while lat <= 78.0:
+            off = (step / 2.0) if (row % 2) else 0.0
+            lon = -180.0
+            while lon < 180.0:
+                from shapely.geometry import Point
+                if union.contains(Point(lon + off, lat)):
+                    dla_list.append(lat)
+                    dlo_list.append(lon + off)
+                lon += step
+            lat += step
+            row += 1
+        import numpy as _np  # placeholder (unreachable without numpy)
+        dla, dlo = dla_list, dlo_list  # type: ignore
+    ccy_geo = _ccy_unions(paths["cty"])  # type: ignore
+    labels: list[str | None] = [None] * len(dla)
+    if HAVE_NP and np is not None:
+        import numpy as _np2
+        order = sorted(ccy_geo, key=lambda c: CCY_LIST.index(c))
+        for cur in order:
+            try:
+                hit = contains_xy(ccy_geo[cur], _np2.asarray(dlo),
+                                  _np2.asarray(dla))
+            except Exception:
+                continue
+            for i in _np2.nonzero(hit)[0]:
+                labels[int(i)] = cur
+    else:
+        for i, (la, lo) in enumerate(zip(dla, dlo)):
+            for cur in CCY_LIST:
+                try:
+                    if ccy_geo[cur].contains(
+                            __import__("shapely").geometry.Point(lo, la)):
+                        labels[i] = cur
+                        break
+                except Exception:
+                    continue
+    dots = [(float(la), float(lo)) for la, lo in zip(dla, dlo)]
+    CCY_GEO.clear()
+    CCY_GEO.update(ccy_geo)
+    res = "50m" if "50m" in (paths["cty"] or "") else "110m"
+    return dots, labels, f"NaturalEarth land-50m + cty-{res}"
+
+
+def _load_dots_cache() -> tuple[list, list, str] | None:
+    try:
+        if not os.path.exists(DOTS_CACHE):
+            return None
+        if HAVE_NP and np is not None:
+            z = np.load(DOTS_CACHE, allow_pickle=True)
+            step = float(z["step"])
+            if abs(step - DOT_STEP) > 1e-9:
+                return None
+            dots = [(float(a), float(o)) for a, o in
+                    zip(z["lat"], z["lon"])]
+            idx = [int(i) for i in z["ccy"]]
+            labels = [CCY_LIST[i] if 0 <= i < len(CCY_LIST) else None
+                      for i in idx]
+            return dots, labels, str(z["source"])
+    except Exception:
+        pass
+    return None
+
+
+def _save_dots_cache(dots, labels, source: str) -> None:
+    try:
+        if not (HAVE_NP and np is not None):
+            return
+        os.makedirs(os.path.dirname(DOTS_CACHE), exist_ok=True)
+        lat = np.array([la for la, _ in dots], dtype=np.float32)
+        lon = np.array([lo for _, lo in dots], dtype=np.float32)
+        idx = np.array([CCY_LIST.index(c) if c in CCY_LIST else -1
+                        for c in labels], dtype=np.int8)
+        np.savez_compressed(DOTS_CACHE, lat=lat, lon=lon, ccy=idx,
+                            step=np.float64(DOT_STEP),
+                            source=np.array(source))
+    except Exception:
+        pass
+
+
+def _load_ccy_geo_only() -> None:
+    """Load country unions for hover when dots came from cache/fallback."""
+    if CCY_GEO or not _have_shapely():
+        return
+    try:
+        paths = ensure_map_files()
+        if paths["cty"]:
+            CCY_GEO.update(_ccy_unions(paths["cty"]))  # type: ignore
+    except Exception:
+        pass
+
+
+_CCY_GEO_TRIED = False
+
+
+def _ensure_ccy_geo() -> None:
+    """Lazy one-time country-polygon load (first hover, not import)."""
+    global _CCY_GEO_TRIED
+    if CCY_GEO or _CCY_GEO_TRIED or not _have_shapely():
+        return
+    _CCY_GEO_TRIED = True
+    _load_ccy_geo_only()
+
+
+def country_at(lat: float, lon: float) -> str | None:
+    """Return watchlist currency containing (lat, lon), else None.
+
+    Polygon-accurate (Natural Earth borders) when map data is loaded;
+    otherwise falls back to centroid circles + metro circles.
+    Overlaps resolve to the smallest containing geometry.
+    """
+    if not CCY_GEO:
+        _ensure_ccy_geo()
+    if CCY_GEO:
+        try:
+            from shapely.geometry import Point
+            pt = Point(lon, lat)
+            best: str | None = None
+            best_area = float("inf")
+            for cur in CCY_LIST:
+                g = CCY_GEO.get(cur)
+                if g is None:
+                    continue
+                try:
+                    b = g.bounds
+                    if not (b[0] - 0.5 <= lon <= b[2] + 0.5 and
+                            b[1] - 0.5 <= lat <= b[3] + 0.5):
+                        continue
+                    if g.contains(pt) and g.area < best_area:
+                        best, best_area = cur, g.area
+                except Exception:
+                    continue
+            if best is not None:
+                return best
+        except Exception:
+            pass
+    best2: str | None = None
     best_d = 1e18
     for cur, (clat, clon, rad, _name) in COUNTRIES.items():
         d = ang_dist_deg(lat, lon, clat, clon)
         if d <= rad and d < best_d:
-            best, best_d = cur, d
+            best2, best_d = cur, d
     try:
         extras = EXTRA_CENTERS
     except NameError:
@@ -576,8 +907,8 @@ def country_at(lat: float, lon: float) -> str | None:
         for (clat, clon, rad) in pts:
             d = ang_dist_deg(lat, lon, clat, clon)
             if d <= rad and d < best_d:
-                best, best_d = cur, d
-    return best
+                best2, best_d = cur, d
+    return best2
 
 
 # Dense dotted globe: dot count scales as 1/step^2, so step 2.0 -> 0.63
@@ -603,12 +934,105 @@ def build_land_dots(step: float = DOT_STEP) -> list[tuple[float, float]]:
     return dots
 
 
-LAND_DOTS: list[tuple[float, float]] = build_land_dots()
+LAND_DOTS: list[tuple[float, float]] = []
+DOT_COUNTRY: list[str | None] = []
+MAP_SOURCE = "built-in coarse"
 
-# Static per-dot country membership (rotation-independent).  Precomputing
-# once keeps the 31k-dot render fast: per-frame lookup is O(1) instead of
-# 31k x 9 great-circle distances.
-DOT_COUNTRY: list[str | None] = [country_at(la, lo) for (la, lo) in LAND_DOTS]
+_cached = _load_dots_cache()
+if _cached is not None:
+    LAND_DOTS, DOT_COUNTRY, MAP_SOURCE = _cached
+    # Country polygons load lazily on first hover (keeps import instant).
+elif _have_shapely():
+    try:
+        LAND_DOTS, DOT_COUNTRY, MAP_SOURCE = build_accurate_dots()
+        _save_dots_cache(LAND_DOTS, DOT_COUNTRY, MAP_SOURCE)
+    except Exception:
+        LAND_DOTS = build_land_dots()
+        DOT_COUNTRY = [country_at(la, lo) for (la, lo) in LAND_DOTS]
+else:
+    LAND_DOTS = build_land_dots()
+    DOT_COUNTRY = [country_at(la, lo) for (la, lo) in LAND_DOTS]
+
+# Static per-dot country membership (rotation-independent) is precomputed
+# above: per-frame lookup is O(1) dict membership, never per-dot distances.
+
+# --- Vectorized globe math (numpy): ~100x faster than per-dot Python. ---
+if HAVE_NP and np is not None and LAND_DOTS:
+    _LA = np.array([la for la, _ in LAND_DOTS], dtype=np.float32)
+    _LO = np.array([lo for _, lo in LAND_DOTS], dtype=np.float32)
+    _lr = np.radians(_LA)
+    _or = np.radians(_LO)
+    D_SIN_LA = np.sin(_lr).astype(np.float32)
+    D_COS_LA = np.cos(_lr).astype(np.float32)
+    D_SIN_LO = np.sin(_or).astype(np.float32)
+    D_COS_LO = np.cos(_or).astype(np.float32)
+    DOTS_CCY = np.array([CCY_LIST.index(c) if c in CCY_LIST else -1
+                         for c in DOT_COUNTRY], dtype=np.int8)
+    del _LA, _LO, _lr, _or
+else:
+    D_SIN_LA = D_COS_LA = D_SIN_LO = D_COS_LO = None  # type: ignore
+    DOTS_CCY = None  # type: ignore
+
+
+def _ramp_lut(a: tuple[int, int, int], b: tuple[int, int, int],
+              n: int = 16):
+    return (((np.array(a, dtype=np.float32)[None, :] +
+              (np.array(b, dtype=np.float32) - np.array(a, dtype=np.float32)
+               )[None, :] * np.linspace(0, 1, n)[:, None])
+             ).astype(np.uint8) if HAVE_NP else None)
+
+
+if HAVE_NP:
+    LUT_NORMAL = _ramp_lut((40, 40, 40), (178, 178, 178))
+    LUT_ALERT = _ramp_lut((122, 58, 58), (255, 154, 154))
+    LUT_HOVER = _ramp_lut((60, 120, 120), (180, 255, 255))
+    # Graticule sample lines (orthographic, projected per frame with numpy).
+    _GRAT: list[tuple[object, object]] = []
+    _gk = np.linspace(0, 1, 97, dtype=np.float32)
+    for _lat in range(-60, 61, 30):
+        _GRAT.append((np.full(97, np.float32(_lat), dtype=np.float32),
+                      (-180.0 + _gk * 360.0).astype(np.float32)))
+    for _lon in range(-180, 180, 30):
+        _GRAT.append(((-90.0 + _gk * 180.0).astype(np.float32),
+                      np.full(97, np.float32(_lon), dtype=np.float32)))
+    del _gk, _lat, _lon
+else:
+    LUT_NORMAL = LUT_ALERT = LUT_HOVER = None  # type: ignore
+    _GRAT = []  # type: ignore
+
+
+def _project_line(lats, lons, lon0: float, lat0: float):
+    """Project a polyline sample -> (x, y, cos_c) unit-space arrays."""
+    la0 = np.radians(np.float32(lat0))
+    lo0 = np.radians(np.float32(lon0))
+    la = np.radians(np.asarray(lats, dtype=np.float32))
+    dlo = np.radians(np.asarray(lons, dtype=np.float32) - np.float32(lon0))
+    sla, cla = np.sin(la), np.cos(la)
+    sin_la0, cos_la0 = np.sin(la0), np.cos(la0)
+    cos_c = sin_la0 * sla + cos_la0 * cla * np.cos(dlo)
+    x = cla * np.sin(dlo)
+    y = cos_la0 * sla - sin_la0 * cla * np.cos(dlo)
+    return x, y, cos_c
+
+
+def _project_dots(lon0: float, lat0: float):
+    """Vectorized orthographic projection of every dot.
+
+    Returns (x, y, cos_c, depth_idx) float32/int arrays in unit-sphere
+    space (~1ms for ~38k dots).  Caller multiplies x/y by R and adds cx/cy.
+    """
+    la0 = np.radians(np.float32(lat0))
+    lo0 = np.radians(np.float32(lon0))
+    sin_lo0, cos_lo0 = np.sin(lo0), np.cos(lo0)
+    sin_d = D_SIN_LO * cos_lo0 - D_COS_LO * sin_lo0
+    cos_d = D_COS_LO * cos_lo0 + D_SIN_LO * sin_lo0
+    sin_la0, cos_la0 = np.sin(la0), np.cos(la0)
+    cos_c = sin_la0 * D_SIN_LA + cos_la0 * D_COS_LA * cos_d
+    x = D_COS_LA * sin_d
+    y = cos_la0 * D_SIN_LA - sin_la0 * D_COS_LA * cos_d
+    depth = np.clip(((cos_c - 0.03) / 0.97 * 15.999).astype(np.int32),
+                    0, 15)
+    return x, y, cos_c, depth
 
 
 NEON = "#39ff14"
@@ -750,6 +1174,10 @@ class GlobeApp:
             raise RuntimeError("Pillow is required for the globe (pip install pillow)")
         self._build_ui()
         self._fetch_async()
+        try:
+            schedule_google_refresh()
+        except Exception:
+            pass
         self._tick_timer()
         self._tick_globe()
         self._tick_log()
@@ -959,7 +1387,7 @@ class GlobeApp:
             self._draw_timer()
         except Exception:
             pass
-        self.root.after(11, self._tick_timer)
+        self.root.after(33, self._tick_timer)
 
     def _now_dt(self):
         if self.utc:
@@ -1188,30 +1616,46 @@ class GlobeApp:
 
 
         grat = (46, 46, 46)
-        for lat in range(-60, 61, 30):
-            pts = []
-            for k in range(97):
-                pr = self._project(lat, -180 + k * (360 / 96), cx, cy, R)
-                if pr is not None and pr[2] > 0.02:
-                    pts.append((pr[0], pr[1]))
-                else:
-                    if len(pts) > 1:
-                        dr.line(pts, fill=grat)
-                    pts = []
-            if len(pts) > 1:
-                dr.line(pts, fill=grat)
-        for lon in range(-180, 180, 30):
-            pts = []
-            for k in range(97):
-                pr = self._project(-90 + k * (180 / 96), lon, cx, cy, R)
-                if pr is not None and pr[2] > 0.02:
-                    pts.append((pr[0], pr[1]))
-                else:
-                    if len(pts) > 1:
-                        dr.line(pts, fill=grat)
-                    pts = []
-            if len(pts) > 1:
-                dr.line(pts, fill=grat)
+        if HAVE_NP and _GRAT:
+            for _lats, _lons in _GRAT:
+                _gx, _gy, _gc = _project_line(_lats, _lons, self.lon0,
+                                              self.lat0)
+                _pts: list = []
+                for _k in range(97):
+                    if _gc[_k] > 0.02:
+                        _pts.append((cx + float(_gx[_k]) * R,
+                                     cy - float(_gy[_k]) * R))
+                    else:
+                        if len(_pts) > 1:
+                            dr.line(_pts, fill=grat)
+                        _pts = []
+                if len(_pts) > 1:
+                    dr.line(_pts, fill=grat)
+        else:
+            for lat in range(-60, 61, 30):
+                pts = []
+                for k in range(97):
+                    pr = self._project(lat, -180 + k * (360 / 96), cx, cy, R)
+                    if pr is not None and pr[2] > 0.02:
+                        pts.append((pr[0], pr[1]))
+                    else:
+                        if len(pts) > 1:
+                            dr.line(pts, fill=grat)
+                        pts = []
+                if len(pts) > 1:
+                    dr.line(pts, fill=grat)
+            for lon in range(-180, 180, 30):
+                pts = []
+                for k in range(97):
+                    pr = self._project(-90 + k * (180 / 96), lon, cx, cy, R)
+                    if pr is not None and pr[2] > 0.02:
+                        pts.append((pr[0], pr[1]))
+                    else:
+                        if len(pts) > 1:
+                            dr.line(pts, fill=grat)
+                        pts = []
+                if len(pts) > 1:
+                    dr.line(pts, fill=grat)
         dr.ellipse([cx - R, cy - R, cx + R, cy + R], outline=(90, 90, 90))
 
 
@@ -1219,6 +1663,170 @@ class GlobeApp:
 
         hover_cur = getattr(self, "hover_cur", None)
 
+        if HAVE_NP and D_SIN_LA is not None:
+            self._draw_dots_fast(img, alerts, imminent_cur, hover_cur,
+                                 cx, cy, R, S)
+        else:
+            self._draw_dots_slow(dr, alerts, imminent_cur, hover_cur,
+                                 cx, cy, R, S)
+
+        for cur, a in sorted(alerts.items(), key=lambda kv: kv[1]["count"]):
+            cc = COUNTRIES.get(cur)
+            if cc is None:
+                continue
+            pr = self._project(cc[0], cc[1], cx, cy, R)
+            if pr is None or pr[2] <= 0.05:
+                continue
+            x, y, _ = pr
+            dx, dy = x - cx, y - cy
+            n = math.hypot(dx, dy) or 1.0
+            ux, uy = dx / n, dy / n
+            L = min(64, 12 + 7 * a["count"])
+            is_next = (cur == imminent_cur)
+            col = RED_BEAM if is_next else ORANGE
+            wdt = 3 if is_next else 2
+            dr.line([(x, y), (x + ux * L, y + uy * L)], fill=col, width=wdt)
+            tip = 3 if is_next else 2
+            dr.ellipse([x + ux * L - tip, y + uy * L - tip,
+                        x + ux * L + tip, y + uy * L + tip], fill=col)
+
+        tops = [c for c in alerts if c in COUNTRIES][:4]
+        for i in range(len(tops)):
+            for j in range(i + 1, len(tops)):
+                a = COUNTRIES[tops[i]][:2]
+                b = COUNTRIES[tops[j]][:2]
+                pts = []
+                for k in range(33):
+                    t = k / 32.0
+                    la = a[0] + (b[0] - a[0]) * t + math.sin(t * math.pi) * 12
+                    dlo = ((b[1] - a[1] + 540) % 360) - 180
+                    lo = a[1] + dlo * t
+                    pr = self._project(la, lo, cx, cy, R)
+                    if pr is not None and pr[2] > 0.05:
+                        pts.append((pr[0], pr[1]))
+                    else:
+                        if len(pts) > 1:
+                            for sgm in range(0, len(pts) - 1, 2):
+                                dr.line([pts[sgm], pts[sgm + 1]],
+                                        fill=(120, 120, 120))
+                        pts = []
+                if len(pts) > 1:
+                    for sgm in range(0, len(pts) - 1, 2):
+                        dr.line([pts[sgm], pts[sgm + 1]],
+                                fill=(120, 120, 120))
+
+        # Hover highlight ring + label: shows exactly which watchlist
+        # country the pointer is over while scrolling/dragging.
+        hover_cur = getattr(self, "hover_cur", None)
+        hover_latlon = getattr(self, "hover_latlon", None)
+        if hover_cur is not None and hover_cur in COUNTRIES:
+            cc = COUNTRIES[hover_cur]
+            pr = self._project(cc[0], cc[1], cx, cy, R)
+            if pr is not None and pr[2] > 0.03:
+                hx, hy, _ = pr
+                rr = 14 + 2.0 * math.sin(self.pulse * 2.0)
+                dr.ellipse([hx - rr, hy - rr, hx + rr, hy + rr],
+                           outline=(125, 249, 255), width=2)
+                dr.ellipse([hx - 3, hy - 3, hx + 3, hy + 3],
+                           fill=(125, 249, 255))
+        if hover_latlon is not None:
+            if hover_cur is not None:
+                htxt = f"▶ {hover_cur} {COUNTRIES[hover_cur][3]}"
+            else:
+                htxt = f"○ {hover_latlon[0]:+.1f}°, {hover_latlon[1]:+.1f}°"
+            dr.text((40, S - 28), htxt, fill=(125, 249, 255))
+
+        m, L = 10, 26
+        for (x0, y0, dx, dy) in ((m, m, 1, 1), (S - m, m, -1, 1),
+                                 (m, S - m, 1, -1), (S - m, S - m, -1, -1)):
+            dr.line([(x0, y0), (x0 + dx * L, y0)], fill=(120, 120, 120),
+                    width=2)
+            dr.line([(x0, y0), (x0, y0 + dy * L)], fill=(120, 120, 120),
+                    width=2)
+
+        dr.text((40, 12), f"LON {self.lon0:06.1f}  LAT {self.lat0:+05.1f}",
+                fill=(90, 90, 90))
+        return img
+
+    def _draw_dots_fast(self, img, alerts, imminent_cur, hover_cur,
+                        cx: float, cy: float, R: float, S: int) -> None:
+        """Blit all ~38k dots via numpy (~4ms).  No per-dot Python."""
+        import numpy as _np
+        x, y, cos_c, depth = _project_dots(self.lon0, self.lat0)
+        vis = (cos_c > 0.03)
+        if not bool(vis.any()):
+            return
+        alert_idx = _np.array([CCY_LIST.index(c) for c in alerts
+                               if c in CCY_LIST], dtype=_np.int8)
+        is_alert = _np.isin(DOTS_CCY,
+                            alert_idx) if alert_idx.size else _np.zeros(
+                                DOTS_CCY.shape, dtype=bool)
+        imm_idx = CCY_LIST.index(imminent_cur) \
+            if imminent_cur in CCY_LIST else -1
+        is_imm = (is_alert & (DOTS_CCY == imm_idx)) if imm_idx >= 0 \
+            else _np.zeros(DOTS_CCY.shape, dtype=bool)
+        hov_idx = CCY_LIST.index(hover_cur) \
+            if hover_cur in CCY_LIST else -1
+        is_hov = (DOTS_CCY == hov_idx) if hov_idx >= 0 else _np.zeros(
+            DOTS_CCY.shape, dtype=bool)
+        blink = 0.75 + 0.25 * math.sin(self.pulse * 2.0)
+        imm_col = (255, int(120 * blink + 60), int(120 * blink + 60))
+        px = _np.clip((cx + x * R).astype(_np.int32), 0, S - 1)
+        py = _np.clip((cy - y * R).astype(_np.int32), 0, S - 1)
+        buf = _np.array(img)  # writable copy; pasted back at the end
+        # size class: 1 | 2 | 3 (+1 when hovered)
+        deep = depth >= 7  # == old depth>=0.45 (7/16=0.4375)
+        size = _np.where(is_alert, _np.where(deep, 3, 2),
+                         _np.where(deep, 2, 1)).astype(_np.int32)
+        size = _np.where(is_hov, size + 1, size)
+        v = vis
+        col = _np.empty((DOTS_CCY.shape[0], 3), dtype=_np.uint8)
+        col[v] = LUT_NORMAL[depth[v]]
+        hov_only = v & is_hov & ~is_alert
+        col[hov_only] = LUT_HOVER[depth[hov_only]]
+        al = v & is_alert & ~is_imm
+        col[al] = LUT_ALERT[depth[al]]
+        im = v & is_imm
+        if bool(im.any()):
+            base = LUT_ALERT[depth[im]].astype(_np.int32)
+            tgt = _np.array(imm_col, dtype=_np.int32)
+            col[im] = (base + (tgt - base) *
+                       (depth[im][:, None] / 15.0)).astype(_np.uint8)
+            if hov_idx >= 0:
+                both = im & is_hov
+                c2 = col[both].astype(_np.int32)
+                c2[:, 0] = _np.minimum(255, c2[:, 0] + 60)
+                c2[:, 1] = _np.minimum(255, c2[:, 1] + 40)
+                c2[:, 2] = _np.minimum(255, c2[:, 2] + 40)
+                col[both] = c2.astype(_np.uint8)
+        buf[py[v], px[v]] = col[v]
+        # grow dots: size>=2 fills 2x2, >=3 fills 3x3 block, >=4 adds cross
+        for _dx, _dy in ((1, 0), (0, 1), (1, 1)):
+            m = v & (size >= 2)
+            if not bool(m.any()):
+                break
+            qx = _np.clip(px[m] + _dx, 0, S - 1)
+            qy = _np.clip(py[m] + _dy, 0, S - 1)
+            buf[qy, qx] = col[m]
+        m3 = v & (size >= 3)
+        if bool(m3.any()):
+            for _dx, _dy in ((-1, 0), (0, -1), (-1, -1), (2, 0), (0, 2),
+                             (2, 1), (1, 2), (2, 2)):
+                qx = _np.clip(px[m3] + _dx, 0, S - 1)
+                qy = _np.clip(py[m3] + _dy, 0, S - 1)
+                buf[qy, qx] = col[m3]
+        m4 = v & (size >= 4)
+        if bool(m4.any()):
+            for _dx, _dy in ((-1, 1), (1, -1), (3, 1), (1, 3), (-2, 0),
+                             (0, -2)):
+                qx = _np.clip(px[m4] + _dx, 0, S - 1)
+                qy = _np.clip(py[m4] + _dy, 0, S - 1)
+                buf[qy, qx] = col[m4]
+        img.paste(Image.fromarray(buf))
+
+    def _draw_dots_slow(self, dr, alerts, imminent_cur, hover_cur,
+                        cx: float, cy: float, R: float, S: int) -> None:
+        """Original per-dot fallback when numpy is unavailable."""
         for (la, lo), dot_cur in zip(LAND_DOTS, DOT_COUNTRY):
             pr = self._project(la, lo, cx, cy, R)
             if pr is None or pr[0] < 0 or pr[0] >= S:
@@ -1257,88 +1865,6 @@ class GlobeApp:
             dr.rectangle([x - s / 2, y - s / 2, x + s / 2, y + s / 2],
                          fill=base)
 
-
-        for cur, a in sorted(alerts.items(), key=lambda kv: kv[1]["count"]):
-            cc = COUNTRIES.get(cur)
-            if cc is None:
-                continue
-            pr = self._project(cc[0], cc[1], cx, cy, R)
-            if pr is None or pr[2] <= 0.05:
-                continue
-            x, y, _ = pr
-            dx, dy = x - cx, y - cy
-            n = math.hypot(dx, dy) or 1.0
-            ux, uy = dx / n, dy / n
-            L = min(64, 12 + 7 * a["count"])
-            is_next = (cur == imminent_cur)
-            col = RED_BEAM if is_next else ORANGE
-            wdt = 3 if is_next else 2
-            dr.line([(x, y), (x + ux * L, y + uy * L)], fill=col, width=wdt)
-            tip = 3 if is_next else 2
-            dr.ellipse([x + ux * L - tip, y + uy * L - tip,
-                        x + ux * L + tip, y + uy * L + tip], fill=col)
-
-
-        tops = [c for c in alerts if c in COUNTRIES][:4]
-        for i in range(len(tops)):
-            for j in range(i + 1, len(tops)):
-                a = COUNTRIES[tops[i]][:2]
-                b = COUNTRIES[tops[j]][:2]
-                pts = []
-                for k in range(33):
-                    t = k / 32.0
-                    la = a[0] + (b[0] - a[0]) * t + math.sin(t * math.pi) * 12
-                    dlo = ((b[1] - a[1] + 540) % 360) - 180
-                    lo = a[1] + dlo * t
-                    pr = self._project(la, lo, cx, cy, R)
-                    if pr is not None and pr[2] > 0.05:
-                        pts.append((pr[0], pr[1]))
-                    else:
-                        if len(pts) > 1:
-                            for sgm in range(0, len(pts) - 1, 2):
-                                dr.line([pts[sgm], pts[sgm + 1]],
-                                        fill=(120, 120, 120))
-                        pts = []
-                if len(pts) > 1:
-                    for sgm in range(0, len(pts) - 1, 2):
-                        dr.line([pts[sgm], pts[sgm + 1]],
-                                fill=(120, 120, 120))
-
-
-        # Hover highlight ring + label: shows exactly which watchlist
-        # country the pointer is over while scrolling/dragging.
-        hover_cur = getattr(self, "hover_cur", None)
-        hover_latlon = getattr(self, "hover_latlon", None)
-        if hover_cur is not None and hover_cur in COUNTRIES:
-            cc = COUNTRIES[hover_cur]
-            pr = self._project(cc[0], cc[1], cx, cy, R)
-            if pr is not None and pr[2] > 0.03:
-                hx, hy, _ = pr
-                rr = 14 + 2.0 * math.sin(self.pulse * 2.0)
-                dr.ellipse([hx - rr, hy - rr, hx + rr, hy + rr],
-                           outline=(125, 249, 255), width=2)
-                dr.ellipse([hx - 3, hy - 3, hx + 3, hy + 3],
-                           fill=(125, 249, 255))
-        if hover_latlon is not None:
-            if hover_cur is not None:
-                htxt = f"▶ {hover_cur} {COUNTRIES[hover_cur][3]}"
-            else:
-                htxt = f"○ {hover_latlon[0]:+.1f}°, {hover_latlon[1]:+.1f}°"
-            dr.text((40, S - 28), htxt, fill=(125, 249, 255))
-
-        m, L = 10, 26
-        for (x0, y0, dx, dy) in ((m, m, 1, 1), (S - m, m, -1, 1),
-                                 (m, S - m, 1, -1), (S - m, S - m, -1, -1)):
-            dr.line([(x0, y0), (x0 + dx * L, y0)], fill=(120, 120, 120),
-                    width=2)
-            dr.line([(x0, y0), (x0, y0 + dy * L)], fill=(120, 120, 120),
-                    width=2)
-
-
-        dr.text((40, 12), f"LON {self.lon0:06.1f}  LAT {self.lat0:+05.1f}",
-                fill=(90, 90, 90))
-        return img
-
     def _update_side(self, events, now):
         alerts = self._alerts(events, now)
         nxt = self._next_event(events, now)
@@ -1351,6 +1877,7 @@ class GlobeApp:
             self._t0 = time.monotonic()
         self.fps_lbl.configure(
             text=f"globe {self._fps:.0f} fps · {len(LAND_DOTS)} dots · "
+                 f"{MAP_SOURCE} · "
                  f"{'AUTO-SPIN' if self.auto else 'HELD'}")
         try:
             self.hover_lbl.configure(text=getattr(self, "hover_label",
