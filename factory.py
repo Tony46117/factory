@@ -12,7 +12,7 @@ No keys, env vars, or manual pip steps. Missing wheels
 
 Default when a display is available: opens a black HUD window with
 
-  * a big glowing-cyan 7-segment clock like the ``inspo2`` timer
+  * a big glowing-blue 7-segment clock like the ``inspo2`` timer
     (HR:MN + small SEC / MS / US, AM/PM, date line),
   * a dense dotted world globe like the ``inspo`` dashboard (10x dot
     density vs the old sparse version for high map contrast).  Drag it
@@ -37,7 +37,7 @@ Coastlines and borders come from Natural Earth 50m land + 50m admin-0
 countries (public domain, https://www.naturalearthdata.com), downloaded
 once and cached - every line on the map is real survey-grade geometry,
 not hand polygons: dotted land plus crisp per-country border outlines
-for all 242 countries, alert-tinted for news currencies and cyan for
+for all 242 countries, alert-tinted for news currencies and blue for
 the hovered country.  Rendering is numpy-vectorized.  Zoom 0.5x-5x via
 wheel / Z+ / Z- / 1:1 / double-click / +/- keys (hover stays exact).
 
@@ -148,7 +148,7 @@ def _have_shapely() -> bool:
 BOLD_WHITE = "\033[1;97m"
 DIM = "\033[2m"
 RESET = "\033[0m"
-CYAN = "\033[96m"
+BLUE = "\033[94m"
 
 _FRAME_W = 33
 
@@ -198,12 +198,12 @@ def build_frame(ns: int, utc: bool = False, use_12h: bool = False,
     date = f"{DIM}{d:%a %Y-%m-%d} {tz}{RESET}"
     fps_s = f"  {DIM}{fps:.0f} fps{RESET}" if fps > 0 else ""
     pad = _FRAME_W - 2
-    top = f"{CYAN}╔{'═' * pad}╗{RESET}"
-    bot = f"{CYAN}╚{'═' * pad}╝{RESET}"
-    mid = f"{CYAN}╠{'═' * pad}╣{RESET}"
+    top = f"{BLUE}╔{'═' * pad}╗{RESET}"
+    bot = f"{BLUE}╚{'═' * pad}╝{RESET}"
+    mid = f"{BLUE}╠{'═' * pad}╣{RESET}"
 
     def _row(text: str, visible: int) -> str:
-        return f"{CYAN}║{RESET} {text}{' ' * max(0, pad - 2 - visible)} {CYAN}║{RESET}"
+        return f"{BLUE}║{RESET} {text}{' ' * max(0, pad - 2 - visible)} {BLUE}║{RESET}"
 
     clock_vis = sum(widths) + 4 + len(suffix)
     lab_vis = sum(widths) + 4
@@ -1271,7 +1271,7 @@ def _ramp_lut(a: tuple[int, int, int], b: tuple[int, int, int],
 if HAVE_NP:
     LUT_NORMAL = _ramp_lut((40, 40, 40), (178, 178, 178))
     LUT_ALERT = _ramp_lut((122, 58, 58), (255, 154, 154))
-    LUT_HOVER = _ramp_lut((60, 120, 120), (180, 255, 255))
+    LUT_HOVER = _ramp_lut((50, 90, 160), (170, 205, 255))
     # Graticule sample lines (orthographic, projected per frame with numpy).
     _GRAT: list[tuple[object, object]] = []
     _gk = np.linspace(0, 1, 97, dtype=np.float32)
@@ -1321,9 +1321,9 @@ def _project_dots(lon0: float, lat0: float):
     return x, y, cos_c, depth
 
 
-NEON = "#00e5ff"
-NEON_DIM = "#00707f"
-NEON_FAINT = "#06333a"
+NEON = "#2e7bff"
+NEON_DIM = "#20509e"
+NEON_FAINT = "#0a1c38"
 TIMER = "#ffffff"
 TIMER_GLOW = "#6e6e6e"
 TIMER_FAINT = "#1f1f1f"
@@ -1365,7 +1365,7 @@ def _vpoly(x: float, y: float, L: float, T: float) -> list[float]:
 
 
 class SevenSeg:
-    """Glowing-cyan 7-segment digit renderer on a tkinter Canvas."""
+    """Glowing-blue 7-segment digit renderer on a tkinter Canvas."""
 
     def __init__(self, canvas, glow: bool = True):
         self.cv = canvas
@@ -1527,7 +1527,7 @@ class GlobeApp:
         style.configure("TButton", background="#0d0d0d", foreground=NEON,
                         font=("Courier New", 9, "bold"),
                         borderwidth=1, relief="solid")
-        style.map("TButton", background=[("active", "#062b30")])
+        style.map("TButton", background=[("active", "#0a2148")])
         style.configure("TCheckbutton", background=BG, foreground="#9a9a9a",
                         font=("Courier New", 9))
 
@@ -1639,7 +1639,7 @@ class GlobeApp:
         self.expand_btn.pack(side="left", padx=2)
         ttk.Label(side, text="── HOVER ──", foreground=NEON,
                   font=("Courier New", 10, "bold")).pack(pady=(4, 2))
-        self.hover_lbl = tk.Label(side, bg=BG, fg="#7df9ff",
+        self.hover_lbl = tk.Label(side, bg=BG, fg="#9ec5ff",
                                   font=("Courier New", 10, "bold"),
                                   wraplength=280, justify="left",
                                   text="— hover globe —")
@@ -2157,7 +2157,7 @@ class GlobeApp:
                      bg=BG, fg=NEON,
                      font=("Courier New", 11, "bold")).pack(side="left")
             tk.Button(top, text="✕ CLOSE", bg="#0d0d0d", fg=NEON,
-                      activebackground="#062b30", relief="solid", bd=1,
+                      activebackground="#0a2148", relief="solid", bd=1,
                       font=("Courier New", 9, "bold"),
                       command=self._close_expand).pack(side="right")
             lbl = tk.Label(tw, bg=BG, bd=1, relief="solid", anchor="center")
@@ -2398,9 +2398,9 @@ class GlobeApp:
                 hx, hy, _ = pr
                 rr = 14 + 2.0 * math.sin(self.pulse * 2.0)
                 dr.ellipse([hx - rr, hy - rr, hx + rr, hy + rr],
-                           outline=(125, 249, 255), width=2)
+                           outline=(147, 197, 253), width=2)
                 dr.ellipse([hx - 3, hy - 3, hx + 3, hy + 3],
-                           fill=(125, 249, 255))
+                           fill=(147, 197, 253))
         # Crosshair exactly under the cursor (proves hover is live).
         if hover_latlon is not None:
             pr = self._project(hover_latlon[0], hover_latlon[1],
@@ -2408,9 +2408,9 @@ class GlobeApp:
             if pr is not None and pr[2] > 0.0:
                 px_, py_, _ = pr
                 dr.line([(px_ - 8, py_), (px_ + 8, py_)],
-                        fill=(125, 249, 255), width=1)
+                        fill=(147, 197, 253), width=1)
                 dr.line([(px_, py_ - 8), (px_, py_ + 8)],
-                        fill=(125, 249, 255), width=1)
+                        fill=(147, 197, 253), width=1)
         if hover_latlon is not None:
             if hover_cur is not None:
                 htxt = f"▶ {hover_cur} {COUNTRIES[hover_cur][3]}"
@@ -2424,7 +2424,7 @@ class GlobeApp:
                 htxt = f"○ {hover_latlon[0]:+.1f}, {hover_latlon[1]:+.1f}"
                 btxt = f"○ {hover_latlon[0]:+.1f}, {hover_latlon[1]:+.1f}"
             # Bottom readout (always).
-            dr.text((40, S - 28), btxt, fill=(125, 249, 255))
+            dr.text((40, S - 28), btxt, fill=(147, 197, 253))
             # Top banner with solid bg so the name is unmissable.
             try:
                 bb = dr.textbbox((0, 0), htxt)
@@ -2434,8 +2434,8 @@ class GlobeApp:
             bx0 = max(4, cx - tw / 2 - 10)
             by0 = 22.0
             dr.rectangle([bx0, by0, bx0 + tw + 20, by0 + th + 12],
-                         fill=(0, 20, 26), outline=(125, 249, 255))
-            dr.text((bx0 + 10, by0 + 6), htxt, fill=(125, 249, 255))
+                         fill=(5, 15, 35), outline=(147, 197, 253))
+            dr.text((bx0 + 10, by0 + 6), htxt, fill=(147, 197, 253))
         else:
             try:
                 htxt0 = hover_label or "— hover globe —"
@@ -2470,7 +2470,7 @@ class GlobeApp:
 
         Base borders dim grey; watchlist currencies with active HIGH-impact
         alerts get a pale-red tint; the hovered country (any of the 242,
-        Africa included) gets a cyan highlight.  Back hemisphere segments
+        Africa included) gets a blue highlight.  Back hemisphere segments
         are clipped per-sample (cos_c > 0.02), like the graticule.
         hover_iso/hover_cur default to the main surface's hover state.
         """
@@ -2505,7 +2505,7 @@ class GlobeApp:
                     ccy = ISO_TO_CCY.get(iso)
                     if iso == hover_iso or (hover_cur and ccy == hover_cur
                                             and hover_iso is None):
-                        col = (125, 249, 255)
+                        col = (147, 197, 253)
                     elif ccy in alert_ccys:
                         col = (210, 130, 130)
                     else:
@@ -2535,7 +2535,7 @@ class GlobeApp:
                     iso, la, lo = entry[0], entry[1], entry[2]
                     ccy = ISO_TO_CCY.get(iso)
                     if iso == hover_iso:
-                        col = (125, 249, 255)
+                        col = (147, 197, 253)
                     elif ccy in alert_ccys:
                         col = (210, 130, 130)
                     else:
@@ -2653,9 +2653,9 @@ class GlobeApp:
             is_hover = hover_cur is not None and dot_cur == hover_cur
             if hit is None:
                 if is_hover:
-                    # Hovered country: bright cyan-white so it pops while
+                    # Hovered country: bright blue-white so it pops while
                     # scrolling, even with no news alert.
-                    base = _lerp((60, 120, 120), (180, 255, 255), depth)
+                    base = _lerp((50, 90, 160), (170, 205, 255), depth)
                 else:
                     base = _lerp((40, 40, 40), DOT, depth)
             else:
