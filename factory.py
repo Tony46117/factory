@@ -33,7 +33,10 @@ directly, so the key is used for geocoding accuracy, not tile rendering.
 Coastlines and borders come from Natural Earth 50m land + 50m admin-0
 countries (public domain, https://www.naturalearthdata.com), downloaded
 once and cached - every line on the map is real survey-grade geometry,
-not hand polygons.  Rendering is numpy-vectorized (~4ms/frame).
+not hand polygons: dotted land plus crisp per-country border outlines
+for all 242 countries, alert-tinted for news currencies and cyan for
+the hovered country.  Rendering is numpy-vectorized.  Zoom 0.5x-5x via
+wheel / Z+ / Z- / 1:1 / double-click / +/- keys (hover stays exact).
 
 Live data comes from the ForexFactory-compatible feed
 (https://nfs.faireconomy.media/ff_calendar_{thisweek,nextweek}.json)
@@ -1075,6 +1078,122 @@ def identify_country(lat: float, lon: float) -> tuple[str, str] | None:
         return None
 
 
+# --- Accurate country borders for ALL countries (crisp overlay). ---
+# Border polylines come from the same Natural Earth 50m admin-0 file
+# (public domain) as hover identification - real survey-grade borders
+# for every country.  Simplified once at load (~0.08deg keeps coastlines
+# true while cutting vertex count), then projected per frame with the
+# same numpy-vectorized orthographic math as the graticule.
+# BORDERS: list of (iso, lats, lons); lats/lons are float32 numpy arrays
+# (or plain lists when numpy is unavailable).
+BORDERS: list = []
+_BORDERS_TRIED = False
+# ISO A3 -> watchlist currency (for alert-tinted borders).
+ISO_TO_CCY: dict[str, str] = {}
+for _ccy, _codes in WATCH_ISO.items():
+    for _code in _codes:
+        ISO_TO_CCY[_code] = _ccy
+
+
+def _rings_of(geom):
+    """Yield exterior+interior rings of a (Multi)Polygon as coord lists."""
+    try:
+        t = geom.geom_type
+    except Exception:
+        return
+    if t == "Polygon":
+        try:
+            yield list(geom.exterior.coords)
+        except Exception:
+            pass
+        try:
+            for ring in geom.interiors:
+                yield list(ring.coords)
+        except Exception:
+            pass
+    elif t in ("MultiPolygon", "GeometryCollection"):
+        try:
+            for part in geom.geoms:
+                yield from _rings_of(part)
+        except Exception:
+            pass
+
+
+def _build_borders(tolerance: float = 0.15) -> None:
+    """Build simplified border polylines from FULL_GEO (lazy, once)."""
+    global BORDERS
+    if BORDERS:
+        return
+    if not FULL_GEO:
+        _ensure_full_geo()
+    if not FULL_GEO:
+        return
+    use_np = HAVE_NP and np is not None
+    out = []
+    for iso, _name, g, _b in FULL_GEO:
+        try:
+            sg = g.simplify(tolerance, preserve_topology=True)
+            if sg.is_empty:
+                sg = g
+        except Exception:
+            sg = g
+        for ring in _rings_of(sg):
+            if len(ring) < 2:
+                continue
+            try:
+                # Antimeridian cut: split ring where lon jumps >180deg
+                # (prevents a streak line across the whole globe).
+                segs: list = []
+                cur: list = [ring[0]]
+                for p0, p1 in zip(ring, ring[1:]):
+                    try:
+                        if abs(p1[0] - p0[0]) > 180.0:
+                            if len(cur) > 1:
+                                segs.append(cur)
+                            cur = [p1]
+                        else:
+                            cur.append(p1)
+                    except Exception:
+                        cur.append(p1)
+                if len(cur) > 1:
+                    segs.append(cur)
+                for s in segs:
+                    if len(s) < 2:
+                        continue
+                    if use_np:
+                        lo = np.array([p[0] for p in s], dtype=np.float32)
+                        la = np.array([p[1] for p in s], dtype=np.float32)
+                    else:
+                        lo = [p[0] for p in s]
+                        la = [p[1] for p in s]
+                    # Bounds + radius for back-hemisphere early reject.
+                    try:
+                        import math as _m
+                        lomin, lomax = float(min(s, key=lambda p: p[0])[0]), float(max(s, key=lambda p: p[0])[0])
+                        lamin, lamax = float(min(s, key=lambda p: p[1])[1]), float(max(s, key=lambda p: p[1])[1])
+                        clat, clon = (lamin + lamax) / 2.0, (lomin + lomax) / 2.0
+                        brad = max(lamax - lamin,
+                                   (lomax - lomin) * _m.cos(_m.radians(clat))) / 2.0
+                    except Exception:
+                        clat, clon, brad = 0.0, 0.0, 180.0
+                    out.append((iso, la, lo, clat, clon, brad))
+            except Exception:
+                continue
+    BORDERS = out
+
+
+def _ensure_borders() -> None:
+    """Lazy one-time border build (not at import)."""
+    global _BORDERS_TRIED
+    if BORDERS or _BORDERS_TRIED:
+        return
+    _BORDERS_TRIED = True
+    try:
+        _build_borders()
+    except Exception:
+        pass
+
+
 # Dense dotted globe: dot count scales as 1/step^2, so step 2.0 -> 0.63
 # gives ~10x dots (≈3k -> ≈31k) for much higher map contrast.
 DOT_STEP = 0.63
@@ -1356,6 +1475,7 @@ class GlobeApp:
             def _preload_geo() -> None:
                 _load_ccy_geo_only()
                 _load_full_geo_only()
+                _ensure_borders()
             th = threading.Thread(target=_preload_geo, daemon=True)
             th.start()
         except Exception:
@@ -1421,11 +1541,16 @@ class GlobeApp:
         self.globe_lbl.bind("<MouseWheel>", self._wheel)
         self.globe_lbl.bind("<Button-4>", self._wheel_linux_in)
         self.globe_lbl.bind("<Button-5>", self._wheel_linux_out)
+        self.globe_lbl.bind("<Double-Button-1>", lambda e: self._zoom_toggle())
         r.bind("<Left>", lambda e: self._nudge(8, 0))
         r.bind("<Right>", lambda e: self._nudge(-8, 0))
         r.bind("<Up>", lambda e: self._nudge(0, 5))
         r.bind("<Down>", lambda e: self._nudge(0, -5))
         r.bind("<space>", lambda e: self._toggle_auto())
+        r.bind("<plus>", lambda e: self._zoom_in())
+        r.bind("<equal>", lambda e: self._zoom_in())
+        r.bind("<minus>", lambda e: self._zoom_out())
+        r.bind("<0>", lambda e: self._zoom_reset())
 
         side = ttk.Frame(mid, width=290)
         side.pack(side="right", fill="y", padx=(8, 0))
@@ -1468,6 +1593,16 @@ class GlobeApp:
         ttk.Checkbutton(brow2, text="High only", variable=self.hivar,
                         command=self._toggle_filter).pack(side="left",
                                                           padx=6)
+        brow3 = ttk.Frame(side)
+        brow3.pack(fill="x", pady=2)
+        ttk.Button(brow3, text="Z+", command=self._zoom_in,
+                   width=6).pack(side="left", padx=2)
+        ttk.Button(brow3, text="Z-", command=self._zoom_out,
+                   width=6).pack(side="left", padx=2)
+        ttk.Button(brow3, text="1:1", command=self._zoom_reset,
+                   width=6).pack(side="left", padx=2)
+        self.zoom_lbl = ttk.Label(brow3, text="x1.00")
+        self.zoom_lbl.pack(side="left", padx=6)
         ttk.Label(side, text="── HOVER ──", foreground=NEON,
                   font=("Courier New", 10, "bold")).pack(pady=(4, 2))
         self.hover_lbl = tk.Label(side, bg=BG, fg="#7df9ff",
@@ -1756,15 +1891,39 @@ class GlobeApp:
                 self.hover_iso, self.hover_name = cur, name
             self.hover_label = f"▶ {cur} {name}  ({ll[0]:+.1f}°, {ll[1]:+.1f}°)"
 
+    ZOOM_MIN = 0.5
+    ZOOM_MAX = 5.0
+    ZOOM_STEP = 1.12
+
     def _zoom(self, f: float):
-        self.zoom = max(0.65, min(1.5, self.zoom * f))
+        zmin = float(getattr(self, "ZOOM_MIN", 0.5))
+        zmax = float(getattr(self, "ZOOM_MAX", 5.0))
+        self.zoom = max(zmin, min(zmax, self.zoom * f))
+
+    def _zoom_in(self):
+        self._zoom(self.ZOOM_STEP)
+        self.last_drag = time.monotonic()
+
+    def _zoom_out(self):
+        self._zoom(1 / self.ZOOM_STEP)
+        self.last_drag = time.monotonic()
+
+    def _zoom_reset(self):
+        self.zoom = 1.0
+        self.last_drag = time.monotonic()
+
+    def _zoom_toggle(self):
+        # Double-click: jump between overview and close-up.
+        self.zoom = 2.6 if self.zoom < 1.8 else 1.0
+        self.last_drag = time.monotonic()
 
     def _wheel(self, e):
         try:
             self.hover_xy = (e.x, e.y)
         except Exception:
             pass
-        self._zoom(1.08 if getattr(e, "delta", 0) > 0 else 1 / 1.08)
+        self._zoom(self.ZOOM_STEP if getattr(e, "delta", 0) > 0
+                   else 1 / self.ZOOM_STEP)
         self.last_drag = time.monotonic()
 
     def _wheel_linux_in(self, e):
@@ -1772,7 +1931,7 @@ class GlobeApp:
             self.hover_xy = (e.x, e.y)
         except Exception:
             pass
-        self._zoom(1.08)
+        self._zoom(self.ZOOM_STEP)
         self.last_drag = time.monotonic()
 
     def _wheel_linux_out(self, e):
@@ -1780,7 +1939,7 @@ class GlobeApp:
             self.hover_xy = (e.x, e.y)
         except Exception:
             pass
-        self._zoom(1 / 1.08)
+        self._zoom(1 / self.ZOOM_STEP)
         self.last_drag = time.monotonic()
 
     def _nudge(self, dx: float, dy: float):
@@ -1934,6 +2093,12 @@ class GlobeApp:
             self._draw_dots_slow(dr, alerts, imminent_cur, hover_cur,
                                  cx, cy, R, S)
 
+        # Accurate country borders (all countries) over the dots.
+        try:
+            self._draw_borders(dr, alerts, cx, cy, R)
+        except Exception:
+            pass
+
         for cur, a in sorted(alerts.items(), key=lambda kv: kv[1]["count"]):
             cc = COUNTRIES.get(cur)
             if cc is None:
@@ -2052,9 +2217,97 @@ class GlobeApp:
             dr.line([(x0, y0), (x0, y0 + dy * L)], fill=(120, 120, 120),
                     width=2)
 
-        dr.text((40, 12), f"LON {self.lon0:06.1f}  LAT {self.lat0:+05.1f}",
+        dr.text((40, 12), f"LON {self.lon0:06.1f}  LAT {self.lat0:+05.1f}  "
+                f"ZOOM x{self.zoom:.2f}",
                 fill=(90, 90, 90))
         return img
+
+    def _draw_borders(self, dr, alerts, cx: float, cy: float,
+                      R: float) -> None:
+        """Draw accurate Natural Earth borders for every country.
+
+        Base borders dim grey; watchlist currencies with active HIGH-impact
+        alerts get a pale-red tint; the hovered country (any of the 242,
+        Africa included) gets a cyan highlight.  Back hemisphere segments
+        are clipped per-sample (cos_c > 0.02), like the graticule.
+        """
+        _ensure_borders()
+        if not BORDERS:
+            return
+        hover_iso = getattr(self, "hover_iso", None)
+        hover_cur = getattr(self, "hover_cur", None)
+        alert_ccys = set(alerts) if alerts else set()
+        try:
+            zoom = float(getattr(self, "zoom", 1.0))
+        except Exception:
+            zoom = 1.0
+        # Low zoom: every 2nd vertex is plenty (halves cost, still crisp).
+        stride = 1 if zoom >= 1.8 else 2
+        try:
+            vlat = float(self.lat0)
+            vlon = float(self.lon0 if self.lon0 <= 180 else self.lon0 - 360)
+        except Exception:
+            vlat, vlon = 22.0, -40.0
+        # Per-ISO alert lookup via ISO_TO_CCY (EUR covers 20 ISOs, etc.).
+        if HAVE_NP and np is not None and _GRAT is not None:
+            for entry in BORDERS:
+                try:
+                    iso, la, lo = entry[0], entry[1], entry[2]
+                    clat, clon, brad = entry[3], entry[4], entry[5]
+                    # Back-hemisphere early reject (skips ~60% of borders).
+                    if ang_dist_deg(vlat, vlon, clat, clon) > 97.0 + brad:
+                        continue
+                    ccy = ISO_TO_CCY.get(iso)
+                    if iso == hover_iso or (hover_cur and ccy == hover_cur
+                                            and hover_iso is None):
+                        col = (125, 249, 255)
+                    elif ccy in alert_ccys:
+                        col = (210, 130, 130)
+                    else:
+                        col = (105, 105, 105)
+                    sla, slo = la[::stride], lo[::stride]
+                    gx, gy, gc = _project_line(sla, slo, self.lon0, self.lat0)
+                    vis = gc > 0.02
+                    if not bool(vis.any()):
+                        continue
+                    # Contiguous visible runs -> polylines (no per-hidden-pt work).
+                    idx = np.nonzero(vis)[0]
+                    breaks = np.nonzero(np.diff(idx) > 1)[0]
+                    start = 0
+                    ox = cx + gx * R
+                    oy = cy - gy * R
+                    for b in list(breaks) + [len(idx) - 1]:
+                        run = idx[start:b + 1]
+                        start = b + 1
+                        if len(run) > 1:
+                            dr.line(list(zip(ox[run].tolist(),
+                                              oy[run].tolist())), fill=col)
+                except Exception:
+                    continue
+        else:
+            for entry in BORDERS:
+                try:
+                    iso, la, lo = entry[0], entry[1], entry[2]
+                    ccy = ISO_TO_CCY.get(iso)
+                    if iso == hover_iso:
+                        col = (125, 249, 255)
+                    elif ccy in alert_ccys:
+                        col = (210, 130, 130)
+                    else:
+                        col = (105, 105, 105)
+                    pts = []
+                    for a, o in zip(la, lo):
+                        pr = self._project(float(a), float(o), cx, cy, R)
+                        if pr is not None and pr[2] > 0.02:
+                            pts.append((pr[0], pr[1]))
+                        else:
+                            if len(pts) > 1:
+                                dr.line(pts, fill=col)
+                            pts = []
+                    if len(pts) > 1:
+                        dr.line(pts, fill=col)
+                except Exception:
+                    continue
 
     def _draw_dots_fast(self, img, alerts, imminent_cur, hover_cur,
                         cx: float, cy: float, R: float, S: int) -> None:
@@ -2082,11 +2335,17 @@ class GlobeApp:
         px = _np.clip((cx + x * R).astype(_np.int32), 0, S - 1)
         py = _np.clip((cy - y * R).astype(_np.int32), 0, S - 1)
         buf = _np.array(img)  # writable copy; pasted back at the end
-        # size class: 1 | 2 | 3 (+1 when hovered)
+        # size class: 1 | 2 | 3 (+1 when hovered, +1 when deep-zoomed)
         deep = depth >= 7  # == old depth>=0.45 (7/16=0.4375)
         size = _np.where(is_alert, _np.where(deep, 3, 2),
                          _np.where(deep, 2, 1)).astype(_np.int32)
         size = _np.where(is_hov, size + 1, size)
+        try:
+            _zbump = 1 if float(getattr(self, "zoom", 1.0)) >= 2.2 else 0
+        except Exception:
+            _zbump = 0
+        if _zbump:
+            size = size + _zbump
         v = vis
         col = _np.empty((DOTS_CCY.shape[0], 3), dtype=_np.uint8)
         col[v] = LUT_NORMAL[depth[v]]
@@ -2170,6 +2429,11 @@ class GlobeApp:
                 s = 2 if depth < 0.5 else 3
             if is_hover:
                 s += 1
+            try:
+                if float(getattr(self, "zoom", 1.0)) >= 2.2:
+                    s += 1
+            except Exception:
+                pass
             dr.rectangle([x - s / 2, y - s / 2, x + s / 2, y + s / 2],
                          fill=base)
 
@@ -2190,6 +2454,10 @@ class GlobeApp:
         try:
             self.hover_lbl.configure(text=getattr(self, "hover_label",
                                                   "— hover globe —"))
+        except Exception:
+            pass
+        try:
+            self.zoom_lbl.configure(text=f"x{self.zoom:.2f}")
         except Exception:
             pass
         if nxt is not None:
